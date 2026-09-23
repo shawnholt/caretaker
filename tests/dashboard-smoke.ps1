@@ -40,6 +40,11 @@ try {
   & $dashboardScript -EvidenceRoot $fixtureRoot -OutputPath $outputPath | Out-Null
   $html = [System.IO.File]::ReadAllText($outputPath)
   Assert-True ($html.Contains('FRESH')) 'freshness is computed from capturedAtUtc'
+  Assert-True ($html.Contains('Freshness when generated')) 'static freshness label identifies when it was evaluated'
+  Assert-True ($html.Contains('4 / 6 OK')) 'coverage summary counts only modules explicitly reported OK'
+  Assert-True ($html.Contains('Saved rows; coverage may be partial')) 'listener tile describes its evidence limit'
+  Assert-True ($html.Contains('SAVED EVIDENCE') -and $html.Contains('Evidence mode')) 'page identifies its static saved-evidence scope'
+  Assert-True ($html.Contains('does not certify overall machine health')) 'coverage is not presented as an overall health claim'
   Assert-True ($html.Contains('DEGRADED')) 'partial module state is displayed'
   Assert-True ($html.Contains('UNKNOWN')) 'unknown module state remains visible'
   Assert-True ($html.Contains('100.0 MiB')) 'process memory is displayed in descending order'
@@ -50,6 +55,7 @@ try {
   Assert-True (-not $html.Contains('PRIVATE-SECOND-COMMAND')) 'non-top process command lines are omitted'
   Assert-True (-not $html.Contains('PRIVATE-LISTENER-COMMAND')) 'listener command lines are omitted'
   Assert-True ($html.Contains('does not poll Windows') -and $html.Contains('claim live status')) 'page does not claim live monitoring'
+  Assert-True ($html.Contains('href="#coverage"') -and $html.Contains('href="#processes"') -and $html.Contains('href="#listeners"')) 'section navigation points to evidence panels'
 
   $missingRoot = Join-Path $fixtureRoot 'missing'
   [System.IO.Directory]::CreateDirectory($missingRoot) | Out-Null
@@ -62,8 +68,9 @@ try {
   [System.IO.File]::WriteAllText((Join-Path $missingRoot 'snapshot.json'), '{}', (New-Object System.Text.UTF8Encoding($false)))
   & $dashboardScript -EvidenceRoot $missingRoot -OutputPath $missingOutput | Out-Null
   $partialHtml = [System.IO.File]::ReadAllText($missingOutput)
-  Assert-True ($partialHtml.Contains('Captured</strong>UNKNOWN')) 'missing timestamp remains unknown'
-  Assert-True ([regex]::Matches($partialHtml, 'class="state-unknown"').Count -eq 6) 'missing coverage remains unknown for all modules'
+  Assert-True ($partialHtml.Contains('UNKNOWN</strong><span class="metric-detail">Timestamp from saved snapshot')) 'missing timestamp remains unknown'
+  Assert-True ([regex]::Matches($partialHtml, 'class="state state-unknown"').Count -eq 6) 'missing coverage remains unknown for all modules'
+  Assert-True ($partialHtml.Contains('0 / 6 OK') -and $partialHtml.Contains('class="metric-value unknown"')) 'missing evidence does not inflate coverage or freshness'
 
   Write-Output 'Dashboard smoke checks passed.'
 } finally {

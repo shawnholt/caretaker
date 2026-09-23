@@ -70,6 +70,8 @@ if ($capturedValue) {
 }
 
 $coverageNames = @('processes', 'tcpListeners', 'udpEndpoints', 'services', 'tasks', 'startup')
+$coverageOkCount = 0
+$coverageKnownCount = 0
 $coverageHtml = foreach ($name in $coverageNames) {
   $coverage = if ($snapshot) { Read-Coverage $snapshot 'coverage' } else { $null }
   $entry = Read-Coverage $coverage $name
@@ -78,10 +80,14 @@ $coverageHtml = foreach ($name in $coverageNames) {
   if ($entry) {
     $entryStatus = Read-Coverage $entry 'status'
     $entryCount = Read-Coverage $entry 'count'
-    if ($entryStatus -in @('OK', 'DEGRADED', 'UNKNOWN')) { $state = [string]$entryStatus }
+    if ($entryStatus -in @('OK', 'DEGRADED', 'UNKNOWN')) {
+      $state = [string]$entryStatus
+      if ($state -ne 'UNKNOWN') { $coverageKnownCount++ }
+      if ($state -eq 'OK') { $coverageOkCount++ }
+    }
     if ($null -ne $entryCount -and [string]$entryCount -match '^\d+$') { $countLabel = [string]$entryCount }
   }
-  '<tr><th>{0}</th><td class="state-{1}">{2}</td><td>{3}</td></tr>' -f (Html $name), (Html $state.ToLowerInvariant()), (Html $state), (Html $countLabel)
+  '<tr><th>{0}</th><td><span class="state state-{1}">{2}</span></td><td class="count">{3}</td></tr>' -f (Html $name), (Html $state.ToLowerInvariant()), (Html $state), (Html $countLabel)
 }
 
 $processRows = @()
@@ -125,50 +131,95 @@ $listenerHtml = if ($listenerRows.Count -eq 0) {
 }
 
 $problemHtml = if ($snapshotProblem) { '<p class="notice">{0}</p>' -f (Html $snapshotProblem) } else { '' }
+$freshnessClass = if ($freshness.StartsWith('FRESH')) { 'fresh' } elseif ($freshness.StartsWith('STALE')) { 'stale' } else { 'unknown' }
+$capturedSafe = Html $capturedLabel
+$freshnessSafe = Html $freshness
+$tcpCountSafe = Html $tcpCount
+$coverageSummary = '{0} / {1} modules reported a known state' -f $coverageKnownCount, $coverageNames.Count
+$coverageSummarySafe = Html $coverageSummary
 $html = @"
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Goliath Caretaker dashboard</title>
+  <title>Goliath Caretaker — Snapshot dashboard</title>
   <style>
-    :root { color-scheme: light dark; font-family: Segoe UI, sans-serif; }
-    body { max-width: 1050px; margin: 2rem auto; padding: 0 1rem; }
-    h1 { margin-bottom: .25rem; } .muted { opacity: .72; }
-    .notice { padding: .8rem; border-left: 4px solid #d89b26; background: color-mix(in srgb, CanvasText 7%, Canvas); }
-    .facts { display: flex; flex-wrap: wrap; gap: 1.5rem; margin: 1rem 0 1.5rem; }
-    .facts strong { display: block; margin-bottom: .25rem; }
-    table { width: 100%; border-collapse: collapse; margin: .5rem 0 1.75rem; }
-    th, td { text-align: left; padding: .5rem .65rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 18%, Canvas); }
-    th { font-weight: 600; } .state-ok { color: #278344; } .state-degraded { color: #b66b00; } .state-unknown { color: #b66b00; }
-    footer { margin-top: 2rem; font-size: .9rem; }
+    :root { color-scheme: dark; font-family: "Segoe UI", sans-serif; background:#0b1220; color:#e6edf7; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:radial-gradient(ellipse at 70% -20%,#172b43 0,transparent 52%),#0b1220; }
+    .shell { min-height:100vh; display:grid; grid-template-columns:220px minmax(0,1fr); }
+    aside { display:flex; flex-direction:column; gap:22px; padding:24px 16px; border-right:1px solid #233148; background:rgba(10,17,29,.84); }
+    .brand { display:flex; align-items:center; gap:11px; padding:0 8px 18px; border-bottom:1px solid #202d41; }
+    .brand-mark { display:grid; place-items:center; width:36px; height:36px; border-radius:11px; color:#66c7ff; background:#102846; font-size:19px; }
+    .brand strong { display:block; font-size:14px; letter-spacing:.02em; } .brand small { color:#8fa2bc; font-size:11px; }
+    nav { display:grid; gap:5px; } nav a { padding:10px 12px; border-radius:8px; color:#aebed2; text-decoration:none; font-size:13px; }
+    nav a:first-child, nav a:hover { color:#eaf5ff; background:#16283e; box-shadow:inset 2px 0 #31b8ff; }
+    .side-note { margin-top:auto; border:1px solid #293951; border-radius:11px; padding:14px; background:#101b2b; }
+    .side-note b { display:block; margin-bottom:7px; font-size:12px; } .side-note span { color:#a7b8cd; font-size:11px; line-height:1.55; }
+    main { min-width:0; width:min(1420px,100%); margin:0 auto; padding:30px clamp(18px,3vw,44px) 40px; }
+    .topline { display:flex; align-items:flex-start; justify-content:space-between; gap:20px; margin-bottom:24px; }
+    h1 { margin:0 0 6px; font-size:26px; font-weight:650; letter-spacing:-.025em; } .muted { color:#91a2b8; }
+    .subtitle { margin:0; font-size:13px; line-height:1.5; } .snapshot-badge { flex:none; border:1px solid #274763; border-radius:999px; padding:7px 11px; color:#8bd5ff; background:#10243a; font-size:11px; }
+    .notice { margin:0 0 18px; padding:11px 14px; border:1px solid #755b2b; border-radius:9px; color:#f4cd7d; background:#2a2316; font-size:13px; }
+    .metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:13px; margin-bottom:18px; }
+    .metric,.panel { border:1px solid #26364d; border-radius:12px; background:linear-gradient(145deg,rgba(22,34,51,.96),rgba(15,25,39,.97)); box-shadow:0 8px 28px rgba(0,0,0,.12); }
+    .metric { min-height:116px; padding:16px 17px; } .metric-label { color:#91a5bf; font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
+    .metric-value { display:block; margin:11px 0 4px; font-size:21px; font-weight:650; overflow-wrap:anywhere; }
+    .metric-detail { color:#91a2b8; font-size:11px; line-height:1.4; } .fresh { color:#68d6a0; } .stale { color:#f3c46b; } .unknown { color:#f0bd61; }
+    .content-grid { display:grid; grid-template-columns:minmax(0,1.08fr) minmax(0,.92fr); gap:15px; align-items:start; }
+    .stack { display:grid; gap:15px; min-width:0; } .panel { padding:17px; min-width:0; }
+    .panel-head { display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:5px; }
+    h2 { margin:0; font-size:15px; font-weight:650; } .panel-kicker { color:#8497af; font-size:11px; }
+    .panel-copy { margin:6px 0 12px; color:#91a2b8; font-size:11px; line-height:1.5; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th,td { text-align:left; padding:10px 9px; border-bottom:1px solid #243247; vertical-align:middle; }
+    th { color:#8fa2ba; font-size:10px; font-weight:600; letter-spacing:.07em; text-transform:uppercase; }
+    tbody tr:last-child th, tbody tr:last-child td { border-bottom:0; } .count { color:#bac8d9; font-variant-numeric:tabular-nums; }
+    .state { display:inline-flex; min-width:76px; justify-content:center; padding:4px 8px; border-radius:999px; font-size:10px; font-weight:650; letter-spacing:.03em; }
+    .state-ok { color:#75dfad; background:#133428; } .state-degraded { color:#ffd27a; background:#392e19; } .state-unknown { color:#f0bd61; background:#342b1a; }
+    .table-wrap { overflow-x:auto; } .empty { color:#91a2b8; padding:14px 9px; }
+    footer { margin-top:18px; border-top:1px solid #243247; padding-top:14px; color:#8597af; font-size:11px; line-height:1.6; }
+    @media(max-width:900px) { .shell { grid-template-columns:1fr; } aside { padding:13px 16px; border-right:0; border-bottom:1px solid #233148; } .brand { padding-bottom:11px; } nav { grid-template-columns:repeat(4,minmax(0,1fr)); } nav a { text-align:center; padding:8px 5px; } .side-note { display:none; } }
+    @media(max-width:680px) { main { padding-top:22px; } .topline { flex-direction:column; } .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } .content-grid { grid-template-columns:1fr; } nav { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+    @media(max-width:390px) { .metrics { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
-  <h1>Goliath Caretaker</h1>
-  <p class="muted">Saved snapshot report. This page does not poll Windows or claim live status.</p>
-  $problemHtml
-  <div class="facts">
-    <div><strong>Captured</strong>$capturedLabel</div>
-    <div><strong>Freshness</strong>$freshness</div>
-    <div><strong>TCP listeners in snapshot</strong>$tcpCount</div>
+  <div class="shell">
+    <aside>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">◆</span><div><strong>Goliath Caretaker</strong><small>Local workstation view</small></div></div>
+      <nav aria-label="Dashboard sections"><a href="#overview">Overview</a><a href="#coverage">Coverage</a><a href="#processes">Processes</a><a href="#listeners">Listeners</a></nav>
+      <div class="side-note"><b>Evidence mode</b><span>Saved snapshot only<br>Generated on demand<br>No live polling or chat</span></div>
+    </aside>
+    <main>
+      <header class="topline" id="overview"><div><h1>System snapshot</h1><p class="subtitle muted">A compact view of the latest saved inventory. This page does not poll Windows or claim live status.</p></div><span class="snapshot-badge">SAVED EVIDENCE</span></header>
+      $problemHtml
+      <section class="metrics" aria-label="Snapshot summary">
+        <article class="metric"><span class="metric-label">Captured at</span><strong class="metric-value">$capturedSafe</strong><span class="metric-detail">Timestamp from saved snapshot</span></article>
+        <article class="metric"><span class="metric-label">Freshness when generated</span><strong class="metric-value $freshnessClass">$freshnessSafe</strong><span class="metric-detail">Based on snapshot timestamp at page generation</span></article>
+        <article class="metric"><span class="metric-label">TCP listeners</span><strong class="metric-value">$tcpCountSafe</strong><span class="metric-detail">Saved rows; coverage may be partial</span></article>
+        <article class="metric"><span class="metric-label">Coverage</span><strong class="metric-value">$coverageOkCount / $($coverageNames.Count) OK</strong><span class="metric-detail">$coverageSummarySafe</span></article>
+      </section>
+      <div class="content-grid">
+        <div class="stack">
+          <section class="panel" id="coverage"><div class="panel-head"><h2>Inventory coverage</h2><span class="panel-kicker">Snapshot modules</span></div><p class="panel-copy">Each state describes collection coverage for this snapshot; OK does not certify overall machine health.</p><div class="table-wrap"><table><thead><tr><th>Module</th><th>State</th><th>Rows</th></tr></thead><tbody>
+            $($coverageHtml -join "`n            ")
+          </tbody></table></div></section>
+          <section class="panel" id="processes"><div class="panel-head"><h2>Largest working sets</h2><span class="panel-kicker">Top 10 saved rows</span></div><p class="panel-copy">Sorted by observed working set. Paths and command lines are omitted.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>PID</th><th>Working set</th></tr></thead><tbody>
+            $($processHtml -join "`n            ")
+          </tbody></table></div></section>
+        </div>
+        <div class="stack">
+          <section class="panel" id="listeners"><div class="panel-head"><h2>TCP listener sample</h2><span class="panel-kicker">Up to 12 rows</span></div><p class="panel-copy">Local bind details from the saved snapshot. A bind address alone does not prove external reachability.</p><div class="table-wrap"><table><thead><tr><th>Protocol</th><th>Local endpoint</th><th>Process</th></tr></thead><tbody>
+            $($listenerHtml -join "`n            ")
+          </tbody></table></div></section>
+          <section class="panel"><div class="panel-head"><h2>Reading this report</h2><span class="panel-kicker">Evidence limits</span></div><p class="panel-copy">Freshness reflects the saved capture time. DEGRADED means inventory was partial; UNKNOWN means evidence was unavailable or insufficient. Neither missing data nor a recent timestamp establishes health.</p><p class="panel-copy">Create a new report after an on-demand caretaker snapshot when updated evidence is needed.</p></section>
+        </div>
+      </div>
+      <footer>Local static report · No always-on service · No process command lines included</footer>
+    </main>
   </div>
-  <h2>Coverage</h2>
-  <table><thead><tr><th>Module</th><th>State</th><th>Rows</th></tr></thead><tbody>
-    $($coverageHtml -join "`n    ")
-  </tbody></table>
-  <h2>Top processes by working set</h2>
-  <p class="muted">Top 10 from the saved process snapshot; executable paths and command lines are omitted.</p>
-  <table><thead><tr><th>Process</th><th>PID</th><th>Working set</th></tr></thead><tbody>
-    $($processHtml -join "`n    ")
-  </tbody></table>
-  <h2>TCP listener sample</h2>
-  <p class="muted">At most 12 saved rows. Missing or partial coverage is not a clean bill of health.</p>
-  <table><thead><tr><th>Protocol</th><th>Local endpoint</th><th>Process</th></tr></thead><tbody>
-    $($listenerHtml -join "`n    ")
-  </tbody></table>
-  <footer>UNKNOWN means the snapshot did not provide enough evidence. DEGRADED means inventory was partial. Refresh with the caretaker's on-demand snapshot command.</footer>
 </body>
 </html>
 "@
