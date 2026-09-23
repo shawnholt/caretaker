@@ -34,6 +34,26 @@ $futureParent = [pscustomobject]@{ pid = 3; parentPid = 2; creationTimeUtc = '20
 $resolvedProcesses = @(Add-ParentCreationTimes -Processes @($parentProcess, $childProcess, $futureParent))
 Assert-True ($resolvedProcesses[1].parentCreationTimeUtc -eq $parentProcess.creationTimeUtc -and $null -eq $resolvedProcesses[2].parentCreationTimeUtc) 'parent creation time resolves only when the same-snapshot parent predates the child'
 
+$busyBeforeParent = [pscustomobject]@{ pid = 100; parentPid = 0; creationTimeUtc = '2026-01-01T00:00:00Z'; name = 'parent.exe'; executablePath = 'C:\parent.exe'; cpuTicks100ns = 1000 }
+$busyBeforeChild = [pscustomobject]@{ pid = 101; parentPid = 100; creationTimeUtc = '2026-01-01T00:00:01Z'; name = 'child.exe'; executablePath = 'C:\child.exe'; cpuTicks100ns = 2000 }
+$busyAfterParent = [pscustomobject]@{ pid = 100; parentPid = 0; creationTimeUtc = '2026-01-01T00:00:00Z'; name = 'parent.exe'; executablePath = 'C:\parent.exe'; cpuTicks100ns = 1000 }
+$busyAfterChild = [pscustomobject]@{ pid = 101; parentPid = 100; creationTimeUtc = '2026-01-01T00:00:01Z'; name = 'child.exe'; executablePath = 'C:\child.exe'; cpuTicks100ns = 15002000; workingSetBytes = [int64]32000 }
+$busyBefore = @(Add-ParentCreationTimes -Processes @($busyBeforeParent, $busyBeforeChild))
+$busyAfter = @(Add-ParentCreationTimes -Processes @($busyAfterParent, $busyAfterChild))
+$busyResult = Get-BusyRows -Before $busyBefore -After $busyAfter -ElapsedSeconds 1 -Limit 1
+Assert-True ($busyResult.rows.Count -eq 1 -and $busyResult.rows[0].pid -eq 101 -and $busyResult.rows[0].cpuPercentOneCore -eq 150) 'busy ranks CPU deltas only for stable PID, creation, path, parent, and complete ancestry identities'
+Assert-True ($busyResult.rows[0].workingSetBytes -is [int64]) 'busy keeps working set byte counts numeric for JSON consumers'
+$incompleteBusyParent = [pscustomobject]@{ pid = 100; parentPid = 0; creationTimeUtc = '2026-01-01T00:00:00Z'; name = 'parent.exe'; executablePath = ''; cpuTicks100ns = 1000 }
+$incompleteBusyAfter = @(Add-ParentCreationTimes -Processes @($incompleteBusyParent, $busyAfterChild))
+$incompleteBusyResult = Get-BusyRows -Before $busyBefore -After $incompleteBusyAfter -ElapsedSeconds 1 -Limit 1
+Assert-True ($incompleteBusyResult.rows[0].attributionState -eq 'UNKNOWN' -and $incompleteBusyResult.unknownAncestryCount -gt 0) 'busy preserves valid CPU measurement when ancestry is incomplete and marks attribution UNKNOWN'
+$busyChangedPath = [pscustomobject]@{ pid = 101; parentPid = 100; creationTimeUtc = '2026-01-01T00:00:01Z'; name = 'child.exe'; executablePath = 'C:\replaced.exe'; cpuTicks100ns = 15002000; parentCreationTimeUtc = '2026-01-01T00:00:00Z' }
+$busyMismatch = Get-BusyRows -Before $busyBefore -After @($busyAfterParent, $busyChangedPath) -ElapsedSeconds 1 -Limit 1
+Assert-True ($busyMismatch.rows.Count -eq 0) 'busy leaves a PID whose executable path changed unattributed'
+$explanation = [pscustomobject]@{ schemaVersion = 1; action = 'explain'; state = 'UNKNOWN'; coverage = [pscustomobject]@{ process = 'OK'; ancestry = 'UNKNOWN' } }
+$explanationJson = ConvertTo-Json -InputObject $explanation -Depth 5 -Compress | ConvertFrom-Json
+Assert-True ($explanationJson.action -eq 'explain' -and $explanationJson.coverage.ancestry -eq 'UNKNOWN') 'explain JSON shape carries explicit state and coverage'
+
 $startupBefore = [pscustomobject]@{ name = 'Updater'; location = 'Run'; user = 'User'; commandFingerprint = 'hash-one'; command = 'secret-before' }
 $startupAfter = [pscustomobject]@{ name = 'Updater'; location = 'Run'; user = 'User'; commandFingerprint = 'hash-two'; command = 'secret-after' }
 $startupDiffBefore = Get-DiffSummary 'startup' $startupBefore

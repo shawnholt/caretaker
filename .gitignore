@@ -1,7 +1,9 @@
 # Local diagnostic logs and project change history
 /diag_log.txt
+/diag_log.txt.1
 /diag_log-old.txt
 /change_log.txt
+/change_log.txt.1
 
 # Private or generated evidence. Keep reports outside version control.
 /evidence/

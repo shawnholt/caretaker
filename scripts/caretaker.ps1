@@ -1,8 +1,18 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('status', 'doctor', 'snapshot', 'tick')]
+  [ValidateSet('status', 'doctor', 'snapshot', 'tick', 'busy', 'explain', 'events')]
   [string]$Action = 'status',
+  [ValidateRange(1, 3)]
+  [int]$SampleSeconds = 1,
+  [ValidateRange(1, 10)]
+  [int]$Top = 5,
+  [ValidateRange(1, 2147483647)]
+  [int]$ProcessId,
+  [ValidateRange(1, 30)]
+  [int]$WindowDays = 7,
+  [ValidateRange(1, 1000)]
+  [int]$MaxEventsPerLog = 1000,
   [switch]$LibraryOnly
 )
 
@@ -99,10 +109,29 @@ function Get-TaskState {
 
 function Add-CaretakerCommandLog {
   param([string]$Label, [string]$Command, [string]$Reason, [string]$Output)
-  $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
-  $entry = "`r`n[$stamp] $Label`r`nCOMMAND: $Command`r`nREASON: $Reason`r`nOUTPUT:`r`n$Output"
-  if ($script:Transcribing) { $script:CommandLogBuffer.Add($entry) }
-  else { Add-Content -LiteralPath (Join-Path $script:ProjectRoot 'diag_log.txt') -Value $entry }
+  # Routine reads are intentionally quiet. Keep only a short safe summary when
+  # an internal read indicates uncertainty or failure; never persist command
+  # text, raw output, process arguments, or exception details.
+  if ($Output -notmatch '(?i)\b(ERROR|FAILED|WARN|UNKNOWN|BLOCKED|OVER_BUDGET)\b|exitCode=[1-9][0-9]*') { return }
+  Add-CaretakerLogEntry -Label $Label -Outcome 'review required'
+}
+
+function Add-CaretakerLogEntry {
+  param([Parameter(Mandatory = $true)][string]$Label, [Parameter(Mandatory = $true)][string]$Outcome)
+  $logPath = Join-Path $script:ProjectRoot 'diag_log.txt'
+  $backupPath = $logPath + '.1'
+  $maxBytes = 65536
+  $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')] $Label - $Outcome`r`n"
+  $encoding = New-Object System.Text.UTF8Encoding($false)
+  if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+    try {
+      if ((Get-Item -LiteralPath $logPath).Length + $encoding.GetByteCount($entry) -gt $maxBytes) {
+        if (Test-Path -LiteralPath $backupPath -PathType Leaf) { Remove-Item -LiteralPath $backupPath -Force }
+        Move-Item -LiteralPath $logPath -Destination $backupPath
+      }
+    } catch { return }
+  }
+  try { [System.IO.File]::AppendAllText($logPath, $entry, $encoding) } catch { }
 }
 
 function Get-CollectorState {
@@ -222,6 +251,233 @@ function Add-ParentCreationTimes {
     $process | Add-Member -MemberType NoteProperty -Name parentCreationTimeUtc -Value $parentTime -Force
   }
   return $Processes
+}
+
+function Get-AncestrySummary {
+  param([object[]]$Processes, $Target, [int]$MaximumAncestors = 8)
+  if ($null -eq $Target -or -not $Target.creationTimeUtc -or [string]::IsNullOrWhiteSpace([string]$Target.executablePath)) {
+    return [pscustomobject]@{ state = 'UNKNOWN'; text = 'identity incomplete'; chain = @(); reason = 'Process creation time or executable path is unavailable.' }
+  }
+  $index = Get-ProcessIndex -Processes $Processes
+  $chain = New-Object System.Collections.Generic.List[string]
+  $child = $Target
+  $complete = $false
+  $reason = 'Ancestry depth cap reached.'
+  for ($i = 0; $i -lt $MaximumAncestors; $i++) {
+    $parentPid = 0
+    if ($null -eq $child.parentPid -or -not [int]::TryParse([string]$child.parentPid, [ref]$parentPid)) { $reason = 'Parent PID is unavailable.'; break }
+    if ($parentPid -eq 0) { $complete = $true; $reason = $null; break }
+    $parent = $index[[string]$parentPid]
+    if ($null -eq $parent -or -not $parent.creationTimeUtc -or [string]::IsNullOrWhiteSpace([string]$parent.executablePath)) { $reason = 'Parent process identity or path is unavailable in this sample.'; break }
+    $expectedParentTime = [string](Get-OptionalProperty $child 'parentCreationTimeUtc')
+    if ([string]::IsNullOrWhiteSpace($expectedParentTime) -or $expectedParentTime -ne [string]$parent.creationTimeUtc) { $reason = 'Parent creation time does not verify the observed ancestry link.'; break }
+    $chain.Add(('{0} (pid {1}, {2})' -f $parent.name, $parent.pid, $parent.executablePath))
+    $child = $parent
+  }
+  $state = if ($complete) { 'KNOWN' } else { 'UNKNOWN' }
+  $text = if ($chain.Count -gt 0) { $chain -join ' <- ' } else { if ($complete) { 'system root' } else { 'parent chain incomplete' } }
+  return [pscustomobject]@{ state = $state; text = $text; chain = @($chain.ToArray()); reason = $reason }
+}
+
+function Get-OnDemandProcessSample {
+  $raw = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+  $complete = $raw.Count -le 2000
+  $items = foreach ($p in @($raw | Select-Object -First 2000)) {
+    $userTicks = $null; $kernelTicks = $null; $cpuTicks = $null
+    try {
+      $userTicks = [int64]$p.UserModeTime
+      $kernelTicks = [int64]$p.KernelModeTime
+      $cpuTicks = $userTicks + $kernelTicks
+    } catch { }
+    [pscustomobject]@{
+      pid = [int]$p.ProcessId
+      creationTimeUtc = Convert-CreationTime $p.CreationDate
+      name = [string]$p.Name
+      executablePath = [string]$p.ExecutablePath
+      parentPid = if ($null -eq $p.ParentProcessId) { $null } else { [int]$p.ParentProcessId }
+      workingSetBytes = if ($null -eq $p.WorkingSetSize) { $null } else { [int64]$p.WorkingSetSize }
+      cpuTicks100ns = $cpuTicks
+    }
+  }
+  $processes = @(Add-ParentCreationTimes -Processes @($items))
+  return [pscustomobject]@{ processes = $processes; complete = $complete }
+}
+
+function Get-ProcessIdentityKey {
+  param($Process)
+  if ($null -eq $Process -or -not $Process.creationTimeUtc -or [string]::IsNullOrWhiteSpace([string]$Process.executablePath) -or $null -eq $Process.parentPid) { return $null }
+  return ('{0}|{1}|{2}|{3}' -f $Process.pid, $Process.creationTimeUtc, ([string]$Process.executablePath).ToLowerInvariant(), $Process.parentPid)
+}
+
+function Get-BusyRows {
+  param([object[]]$Before, [object[]]$After, [double]$ElapsedSeconds, [int]$Limit)
+  $beforeIndex = Get-ProcessIndex -Processes $Before
+  $rows = New-Object System.Collections.Generic.List[object]
+  $unknownIdentity = 0
+  $unknownAncestry = 0
+  foreach ($process in $After) {
+    $prior = $beforeIndex[[string]$process.pid]
+    $priorKey = Get-ProcessIdentityKey $prior
+    $currentKey = Get-ProcessIdentityKey $process
+    if ($null -eq $prior) { continue }
+    if ($null -eq $priorKey -or $null -eq $currentKey -or $priorKey -ne $currentKey -or $null -eq $process.cpuTicks100ns -or $null -eq $prior.cpuTicks100ns) { $unknownIdentity++; continue }
+    $ancestry = Get-AncestrySummary -Processes $After -Target $process
+    if ($ancestry.state -ne 'KNOWN') { $unknownAncestry++ }
+    $delta = [int64]$process.cpuTicks100ns - [int64]$prior.cpuTicks100ns
+    if ($delta -lt 0) { $unknownIdentity++; continue }
+    if ($delta -eq 0) { continue }
+    $percent = [Math]::Round(($delta / ($ElapsedSeconds * 10000000.0)) * 100.0, 1)
+    $rows.Add([pscustomobject]@{
+      pid = $process.pid; creationTimeUtc = $process.creationTimeUtc; name = $process.name
+      executablePath = $process.executablePath; parentPid = $process.parentPid
+      attributionState = $ancestry.state; ancestry = $ancestry.text
+      cpuPercentOneCore = $percent
+      workingSetBytes = if ($process.PSObject.Properties.Name -contains 'workingSetBytes' -and $null -ne $process.workingSetBytes) { [int64]$process.workingSetBytes } else { $null }
+    })
+  }
+  return [pscustomobject]@{ rows = @($rows | Sort-Object cpuPercentOneCore -Descending | Select-Object -First $Limit); unknownIdentityCount = $unknownIdentity; unknownAncestryCount = $unknownAncestry }
+}
+
+function Get-BusyMemorySummary {
+  param([object[]]$Processes, [int]$Limit)
+  $memoryState = 'UNKNOWN'; $memoryReason = 'Native operating system memory counters unavailable.'
+  $totalBytes = $null; $freeBytes = $null; $usedPercent = $null
+  try {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop | Select-Object -First 1
+    $totalKb = [int64]$os.TotalVisibleMemorySize
+    $freeKb = [int64]$os.FreePhysicalMemory
+    if ($totalKb -le 0 -or $freeKb -lt 0 -or $freeKb -gt $totalKb) { throw 'invalid counters' }
+    $totalBytes = [int64]($totalKb * 1024)
+    $freeBytes = [int64]($freeKb * 1024)
+    $usedPercent = [Math]::Round((($totalKb - $freeKb) / [double]$totalKb) * 100.0, 1)
+    $memoryState = 'OK'; $memoryReason = $null
+  } catch { }
+  $consumers = @($Processes | Where-Object {
+    $null -ne (Get-ProcessIdentityKey $_) -and $null -ne $_.workingSetBytes
+  } | Sort-Object { [int64]$_.workingSetBytes } -Descending | Select-Object -First $Limit | ForEach-Object {
+    $ancestry = Get-AncestrySummary -Processes $Processes -Target $_
+    [pscustomobject]@{
+      pid = $_.pid; creationTimeUtc = $_.creationTimeUtc; parentPid = $_.parentPid
+      name = $_.name; executablePath = $_.executablePath; workingSetBytes = [int64]$_.workingSetBytes
+      attributionState = $ancestry.state; ancestry = $ancestry.text
+    }
+  })
+  $consumerState = if ($consumers.Count -gt 0) { 'OK' } else { 'UNKNOWN' }
+  return [pscustomobject]@{
+    state = if ($memoryState -eq 'OK' -and $consumerState -eq 'OK') { 'OK' } else { 'UNKNOWN' }
+    coverage = [pscustomobject]@{ counters = $memoryState; topConsumers = $consumerState }
+    reason = $memoryReason; totalBytes = $totalBytes; freeBytes = $freeBytes; usedPercent = $usedPercent
+    topConsumers = $consumers
+  }
+}
+
+function Invoke-Busy {
+  $capturedAt = Get-UtcStamp
+  try {
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $before = Get-OnDemandProcessSample
+    Start-Sleep -Seconds $SampleSeconds
+    $after = Get-OnDemandProcessSample
+    $clock.Stop()
+  } catch {
+    return [pscustomobject]@{ schemaVersion = 1; action = 'busy'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; coverage = [pscustomobject]@{ processes = 'UNKNOWN' }; reason = 'Process CPU counters could not be sampled.'; sampleSeconds = $SampleSeconds; processes = @() }
+  }
+  if (-not $before.complete -or -not $after.complete) {
+    return [pscustomobject]@{ schemaVersion = 1; action = 'busy'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; coverage = [pscustomobject]@{ processes = 'DEGRADED' }; reason = 'Process inventory exceeded the 2000 item cap.'; sampleSeconds = $SampleSeconds; processes = @() }
+  }
+  $elapsed = [Math]::Max(0.001, $clock.Elapsed.TotalSeconds)
+  $busy = Get-BusyRows -Before $before.processes -After $after.processes -ElapsedSeconds $elapsed -Limit $Top
+  $memory = Get-BusyMemorySummary -Processes $after.processes -Limit $Top
+  if ($busy.rows.Count -eq 0) {
+    return [pscustomobject]@{ schemaVersion = 1; action = 'busy'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; coverage = [pscustomobject]@{ cpu = 'UNKNOWN'; processIdentity = if ($busy.unknownIdentityCount -gt 0) { 'DEGRADED' } else { 'UNKNOWN' }; ancestry = 'UNKNOWN'; memoryCounters = $memory.coverage.counters; topMemoryConsumers = $memory.coverage.topConsumers }; reason = 'No processes had stable PID, creation time, and path identity across the sample.'; sampleSeconds = $elapsed; memory = $memory; incompleteIdentityCount = $busy.unknownIdentityCount; incompleteAncestryCount = $busy.unknownAncestryCount; processes = @() }
+  }
+  $cpuCoverage = 'OK'
+  $identityCoverage = if ($busy.unknownIdentityCount -gt 0) { 'DEGRADED' } else { 'OK' }
+  $ancestryCoverage = if ($busy.unknownAncestryCount -gt 0 -or @($memory.topConsumers | Where-Object attributionState -ne 'KNOWN').Count -gt 0) { 'UNKNOWN' } else { 'OK' }
+  $state = if ($identityCoverage -ne 'OK' -or $ancestryCoverage -ne 'OK' -or $memory.state -ne 'OK') { 'DEGRADED' } else { 'OK' }
+  return [pscustomobject]@{
+    schemaVersion = 1; action = 'busy'; capturedAtUtc = $capturedAt; state = $state
+    coverage = [pscustomobject]@{ cpu = $cpuCoverage; processIdentity = $identityCoverage; ancestry = $ancestryCoverage; memoryCounters = $memory.coverage.counters; topMemoryConsumers = $memory.coverage.topConsumers }
+    sample = [pscustomobject]@{ requestedSeconds = $SampleSeconds; elapsedSeconds = [Math]::Round($elapsed, 2); cpuUnit = 'percent of one logical CPU' }
+    memory = $memory; incompleteIdentityCount = $busy.unknownIdentityCount; incompleteAncestryCount = $busy.unknownAncestryCount; processCount = $busy.rows.Count; processes = @($busy.rows)
+  }
+}
+
+function Invoke-Explain {
+  $capturedAt = Get-UtcStamp
+  if ($ProcessId -le 0) { return [pscustomobject]@{ schemaVersion = 1; action = 'explain'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; processId = $ProcessId; coverage = [pscustomobject]@{ process = 'UNKNOWN'; ancestry = 'UNKNOWN'; tcpEndpoints = 'UNKNOWN'; udpEndpoints = 'UNKNOWN' }; reason = 'Supply -ProcessId with a positive PID.' } }
+  try {
+    $first = Get-OnDemandProcessSample
+    if (-not $first.complete) { return [pscustomobject]@{ schemaVersion = 1; action = 'explain'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; processId = $ProcessId; coverage = [pscustomobject]@{ process = 'DEGRADED'; ancestry = 'UNKNOWN'; tcpEndpoints = 'UNKNOWN'; udpEndpoints = 'UNKNOWN' }; reason = 'Process inventory exceeded the 2000 item cap.' } }
+    $index = Get-ProcessIndex -Processes $first.processes
+    $target = $index[[string]$ProcessId]
+    if ($null -eq $target) { return [pscustomobject]@{ schemaVersion = 1; action = 'explain'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; processId = $ProcessId; coverage = [pscustomobject]@{ process = 'UNKNOWN'; ancestry = 'UNKNOWN'; tcpEndpoints = 'UNKNOWN'; udpEndpoints = 'UNKNOWN' }; reason = 'PID was not present in the process inventory.' } }
+    $tcpState = 'UNKNOWN'; $tcpReason = 'Native TCP owner query unavailable.'; $tcp = @()
+    try {
+      if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) { throw 'unavailable' }
+      $tcp = @(Get-NetTCPConnection -OwningProcess $ProcessId -ErrorAction Stop | Select-Object -First 20)
+      $tcpState = 'OK'
+      $tcpReason = $null
+    } catch {
+      $tcp = @()
+      if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound_OwningProcess,*') { $tcpState = 'OK'; $tcpReason = $null }
+    }
+    $udpState = 'UNKNOWN'; $udpReason = 'Native UDP owner query unavailable.'; $udp = @()
+    try {
+      if (-not (Get-Command Get-NetUDPEndpoint -ErrorAction SilentlyContinue)) { throw 'unavailable' }
+      $udp = @(Get-NetUDPEndpoint -OwningProcess $ProcessId -ErrorAction Stop | Select-Object -First 20)
+      $udpState = 'OK'
+      $udpReason = $null
+    } catch {
+      $udp = @()
+      if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound_OwningProcess,*') { $udpState = 'OK'; $udpReason = $null }
+    }
+    if ($tcp.Count -ge 20) { $tcpState = 'DEGRADED'; $tcpReason = 'Endpoint cap reached; results may be partial.' }
+    if ($udp.Count -ge 20) { $udpState = 'DEGRADED'; $udpReason = 'Endpoint cap reached; results may be partial.' }
+    $last = Get-OnDemandProcessSample
+    if (-not $last.complete) { return [pscustomobject]@{ schemaVersion = 1; action = 'explain'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; processId = $ProcessId; coverage = [pscustomobject]@{ process = 'DEGRADED'; ancestry = 'UNKNOWN'; tcpEndpoints = 'UNKNOWN'; udpEndpoints = 'UNKNOWN' }; reason = 'Final process inventory exceeded the 2000 item cap.' } }
+    $lastIndex = Get-ProcessIndex -Processes $last.processes
+    $verified = $lastIndex[[string]$ProcessId]
+    $targetKey = Get-ProcessIdentityKey $target
+    $verifiedKey = Get-ProcessIdentityKey $verified
+    if ($null -eq $targetKey -or $null -eq $verifiedKey -or $targetKey -ne $verifiedKey) {
+      return [pscustomobject]@{ schemaVersion = 1; action = 'explain'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; processId = $ProcessId; coverage = [pscustomobject]@{ process = 'UNKNOWN'; ancestry = 'UNKNOWN'; tcpEndpoints = 'UNKNOWN'; udpEndpoints = 'UNKNOWN' }; reason = 'Process identity changed or lacks creation time, path, or parent PID during the explanation.' }
+    }
+    $ancestry = Get-AncestrySummary -Processes $last.processes -Target $verified
+    $result = if ($ancestry.state -eq 'KNOWN' -and $tcpState -eq 'OK' -and $udpState -eq 'OK') { 'OK' } else { 'UNKNOWN' }
+    $tcpItems = @($tcp | ForEach-Object { [pscustomobject]@{ state = [string]$_.State; localAddress = [string]$_.LocalAddress; localPort = [int]$_.LocalPort; remoteAddress = [string]$_.RemoteAddress; remotePort = [int]$_.RemotePort } })
+    $udpItems = @($udp | ForEach-Object { [pscustomobject]@{ localAddress = [string]$_.LocalAddress; localPort = [int]$_.LocalPort } })
+    return [pscustomobject]@{
+      schemaVersion = 1; action = 'explain'; capturedAtUtc = $capturedAt; state = $result; processId = $ProcessId
+      reason = 'Live state only; this does not establish approval or workload ownership.'
+      coverage = [pscustomobject]@{ process = 'OK'; ancestry = $ancestry.state; tcpEndpoints = $tcpState; udpEndpoints = $udpState }
+      process = [pscustomobject]@{ pid = $verified.pid; creationTimeUtc = $verified.creationTimeUtc; parentPid = $verified.parentPid; name = $verified.name; executablePath = $verified.executablePath; workingSetBytes = $verified.workingSetBytes }
+      ancestry = [pscustomobject]@{ state = $ancestry.state; chain = $ancestry.text; reason = $ancestry.reason }
+      endpoints = [pscustomobject]@{ tcp = [pscustomobject]@{ state = $tcpState; reason = $tcpReason; count = $tcpItems.Count; limit = 20; items = $tcpItems }; udp = [pscustomobject]@{ state = $udpState; reason = $udpReason; count = $udpItems.Count; limit = 20; items = $udpItems } }
+    }
+  } catch {
+    return [pscustomobject]@{ schemaVersion = 1; action = 'explain'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; processId = $ProcessId; coverage = [pscustomobject]@{ process = 'UNKNOWN'; ancestry = 'UNKNOWN'; tcpEndpoints = 'UNKNOWN'; udpEndpoints = 'UNKNOWN' }; reason = 'One or more process or endpoint queries were unavailable.' }
+  }
+}
+
+function Invoke-Events {
+  $eventScript = Join-Path $PSScriptRoot 'event-health.ps1'
+  if (-not (Test-Path -LiteralPath $eventScript -PathType Leaf)) {
+    return [pscustomobject]@{ schemaVersion = 1; action = 'events'; capturedAtUtc = (Get-UtcStamp); state = 'UNKNOWN'; coverage = [pscustomobject]@{ System = 'UNKNOWN'; Application = 'UNKNOWN' }; reason = 'Event health script is missing.' }
+  }
+  $exe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  try {
+    $raw = @(& $exe -NoProfile -NonInteractive -File $eventScript -WindowDays $WindowDays -MaxEventsPerLog $MaxEventsPerLog 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'event query failed' }
+    $result = ($raw -join "`n") | ConvertFrom-Json -ErrorAction Stop
+    $result | Add-Member -NotePropertyName action -NotePropertyValue 'events' -Force
+    $coverageStates = @($result.coverage.PSObject.Properties | ForEach-Object { [string]$_.Value.status })
+    $overall = if ($coverageStates -contains 'UNKNOWN') { 'UNKNOWN' } elseif ($coverageStates -contains 'DEGRADED') { 'DEGRADED' } else { 'OK' }
+    $result | Add-Member -NotePropertyName state -NotePropertyValue $overall -Force
+    return $result
+  } catch {
+    return [pscustomobject]@{ schemaVersion = 1; action = 'events'; capturedAtUtc = (Get-UtcStamp); state = 'UNKNOWN'; coverage = [pscustomobject]@{ System = 'UNKNOWN'; Application = 'UNKNOWN' }; reason = 'Event health query or JSON output was unavailable.' }
+  }
 }
 
 function Get-OptionalProperty {
@@ -732,25 +988,40 @@ function Invoke-Tick {
 }
 
 if (-not $LibraryOnly) {
-  $commandText = "powershell -NoProfile -NonInteractive -File `"$PSCommandPath`" $Action"
-  $startedAt = Get-Date -Format o
   $exitCode = 0
   try {
     $captured = @(& {
-      Write-Output ("Caretaker command: {0}" -f $Action)
+      if ($Action -notin @('busy','explain','events')) { Write-Output ("Caretaker command: {0}" -f $Action) }
       switch ($Action) {
         'status' { Invoke-Status }
         'doctor' { Invoke-Doctor }
         'snapshot' { Invoke-Snapshot }
         'tick' { Invoke-Tick }
+        'busy' { Invoke-Busy }
+        'explain' { Invoke-Explain }
+        'events' { Invoke-Events }
       }
     } *>&1)
   } catch {
     $exitCode = 1
-    $captured = @($_)
+    if ($Action -in @('busy','explain','events')) {
+      $captured = @([pscustomobject]@{ schemaVersion = 1; action = $Action; capturedAtUtc = (Get-UtcStamp); state = 'UNKNOWN'; reason = 'Caretaker action failed unexpectedly.' })
+    } else {
+      $captured = @($_)
+    }
   }
-  $rendered = ($captured | Out-String)
+  if ($Action -in @('busy','explain','events')) {
+    $jsonValue = if ($captured.Count -eq 1) { $captured[0] } else { $captured }
+    $rendered = ConvertTo-Json -InputObject $jsonValue -Depth 20 -Compress
+  }
+  else { $rendered = ($captured | Out-String) }
   Write-Output $rendered
-  Add-Content -LiteralPath (Join-Path $script:ProjectRoot 'diag_log.txt') -Value "`r`n[$startedAt] label=caretaker-$Action command=$commandText reason=Run the requested caretaker CLI action; stdout and stderr are captured below. exitCode=$exitCode`r`n$rendered"
+  if ($exitCode -ne 0) {
+    Add-CaretakerLogEntry -Label "caretaker-$Action" -Outcome 'failed'
+  } elseif ($Action -eq 'snapshot') {
+    Add-CaretakerLogEntry -Label 'caretaker-snapshot' -Outcome 'completed'
+  } elseif ($rendered -match '(?i)\b(ERROR|FAILED|WARN|UNKNOWN|DEGRADED|BLOCKED|OVER_BUDGET|NOT READY)\b') {
+    Add-CaretakerLogEntry -Label "caretaker-$Action" -Outcome 'review required'
+  }
   if ($exitCode -ne 0) { exit $exitCode }
 }

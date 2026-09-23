@@ -20,13 +20,22 @@ $script:ActionCmdlet = $PSCmdlet
 
 function Write-RunLog {
   param([string]$Label, [string]$Command, [string]$Reason, [string]$Output)
+  if ($Label -in @('Task Scheduler query', 'Setup plan', 'Setup invocation')) { return }
+  if ($Label -eq 'Lease cleanup command' -and $Output -match '^ExitCode=0') { return }
   $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
-  Add-Content -LiteralPath $script:LogPath -Value "`r`n[$time] $Label`r`nCOMMAND: $Command`r`nREASON: $Reason`r`nOUTPUT:`r`n$Output"
+  if ((Test-Path -LiteralPath $script:LogPath) -and (Get-Item -LiteralPath $script:LogPath).Length -ge 1048576) {
+    Move-Item -LiteralPath $script:LogPath -Destination ($script:LogPath + '.1') -Force
+  }
+  $detail = if ($Output.Length -gt 500) { $Output.Substring(0, 500) + ' [truncated]' } else { $Output }
+  Add-Content -LiteralPath $script:LogPath -Value "`r`n[$time] $Label; command=$Command; outcome=$detail"
 }
 
 function Write-ChangeLog {
   param([string]$Command, [string]$Outcome, [string]$Rollback)
   $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
+  if ((Test-Path -LiteralPath $script:ChangePath) -and (Get-Item -LiteralPath $script:ChangePath).Length -ge 1048576) {
+    Move-Item -LiteralPath $script:ChangePath -Destination ($script:ChangePath + '.1') -Force
+  }
   Add-Content -LiteralPath $script:ChangePath -Value "`r`n[$time] Caretaker task setup`r`nFILES/COMMANDS: scripts/setup.ps1; $Command`r`nOUTCOME: $Outcome`r`nROLLBACK: $Rollback"
 }
 
@@ -52,7 +61,7 @@ function Invoke-LoggedCmdlet {
   param([string]$Command, [string]$Reason, [scriptblock]$ScriptBlock)
   try {
     $output = & $ScriptBlock 2>&1 | Out-String
-    Write-RunLog -Label 'PowerShell system command' -Command $Command -Reason $Reason -Output $output
+    Write-RunLog -Label 'PowerShell system command' -Command $Command -Reason $Reason -Output 'Completed.'
     return $output
   } catch {
     Write-RunLog -Label 'PowerShell system command failed' -Command $Command -Reason $Reason -Output $_.ToString()
@@ -72,8 +81,8 @@ function Get-Task {
     return $task
   } catch {
     $errorText = $_.ToString()
-    Write-RunLog -Label 'Task Scheduler query' -Command "Get-ScheduledTask -TaskName $script:TaskName" -Reason 'Check only the exact manifest-named checker task.' -Output $errorText
     if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) { return $null }
+    Write-RunLog -Label 'Task Scheduler query failed' -Command "Get-ScheduledTask -TaskName $script:TaskName" -Reason 'Check only the exact manifest-named checker task.' -Output $errorText
     throw
   }
 }
@@ -221,7 +230,7 @@ function Invoke-LeaseAction {
   $command = 'powershell.exe ' + ($args -join ' ')
   $output = & $script:WindowsPowerShell @args 2>&1 | Out-String
   $code = $LASTEXITCODE
-  Write-RunLog -Label 'Lease cleanup command' -Command $command -Reason 'Query or stop only the recorded caretaker-owned diagnostic lease before pausing/removing its checker.' -Output "ExitCode=$code`r`n$output"
+  Write-RunLog -Label 'Lease cleanup command' -Command $command -Reason 'Query or stop only the recorded caretaker-owned diagnostic lease before pausing/removing its checker.' -Output "ExitCode=$code"
   if ($code -ne 0) { throw "Lease CLI $LeaseAction failed; checker task left unchanged. See diag_log.txt." }
   try { return $output | ConvertFrom-Json -ErrorAction Stop } catch { throw 'Lease CLI returned invalid JSON; checker task left unchanged.' }
 }
@@ -272,7 +281,7 @@ function Uninstall-OwnedTask {
   Write-ChangeLog -Command "Unregister-ScheduledTask $script:TaskName" -Outcome 'Removed verified owned checker task; preserved evidence and all PerfMon collectors.' -Rollback 'Reinstall only after reviewing the manifest and confirming the exact task name is unused; no collector action is included.'
 }
 
-$invocation = if ($MyInvocation.Line) { $MyInvocation.Line } else { 'powershell -NoProfile -File .\scripts\setup.ps1 -Action ' + $Action }
+$invocation = 'powershell -NoProfile -File .\scripts\setup.ps1 -Action ' + $Action
 Write-RunLog -Label 'Setup invocation' -Command $invocation -Reason "Requested setup action: $Action" -Output 'Started.'
 try {
   switch ($Action) {

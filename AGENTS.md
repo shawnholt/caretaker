@@ -22,6 +22,7 @@ Release 1 project-file work is authorized in this checkout: read and edit projec
 Separate observed facts, desired/approved state, decisions, active leases, and coverage. Repeated observation does not approve a workload. Treat unavailable evidence as `UNKNOWN`, not success. Validate executable identity, process creation time, and ancestry before attribution or action; a PID or process name alone is insufficient. A wildcard bind is not proof of internet exposure.
 
 OpenClaw's native supervisor owns its gateway. The Codex bridge owns its managed-child/stdio lifecycle. Do not add duplicate supervisors, gateways, keepalives, proxies, or watchdogs.
+The read-only direct Codex auth probe may start one short-lived app-server child that it owns, with verified PID, creation time, executable path, and exit. It must not attach to or alter the bridge-owned child, copy credentials, open a listener, or leave a resident supervisor.
 
 Prefer native structured Windows APIs for routine inventory; use Sysinternals command-line tools when they answer a focused question with less code. Add custom code only for Goliath-specific state. Keep Autorunsc optional until it materially improves compact startup coverage. Use ProcDump, Handle, ListDLLs, Sigcheck, and ProcMon on demand only; collector sessions require the lease's owner, deadline, output bound, and verified stop. Never use Handle's close option or enable VirusTotal uploads. Do not add Sysmon or dependencies on PsList, PsService, PsKill, PsSuspend, PsExec, Process Explorer, VMMap, or RAMMap without a demonstrated need.
 
@@ -29,9 +30,9 @@ Temporary diagnostic capture is currently disabled by manifest policy (`leaseSta
 
 ## Logging
 
-Project scripts capture stdout and stderr and append timestamped command, label, reason, and output records to the root `diag_log.txt`; run those scripts directly so output is logged automatically. Any other command executed for this project must capture both streams and append a timestamped block with its label, exact command text, reason, and output. Do not scan existing log contents unless the task explicitly requires it. Keep raw/private evidence under the ignored `evidence/` tree; do not commit logs, XML reports, traces, dumps, credentials, raw process arguments, or private network details.
+Git is the development history. Do not transcript inspection or development commands into `diag_log.txt` or `change_log.txt`. Runtime logs should record failures, warnings, significant caretaker actions, and concise operational outcomes. Bound retained runtime log size; never include raw process arguments or private evidence. Never read a log while appending that same read's output to it. Keep raw/private evidence under ignored `evidence/`; do not commit logs, XML reports, traces, dumps, credentials, raw process arguments, or private network details.
 
-Append project changes to root `change_log.txt` with timestamp, exact files/commands, outcome, and rollback steps. Never overwrite either log. Do not record secrets in logs.
+For actual caretaker-owned setup, lease, or cleanup actions, retain a concise action/outcome/rollback record. No development-command audit log is required.
 
 ## Validation and deployment
 
@@ -45,4 +46,4 @@ Use the self-logging setup script's read-only Plan action before setup. Its Inst
 | ADMIN | Any command requiring elevation | The agent never elevates. Stop on access denied and report the exact blocker; provide a self-contained user-run command only when the requested caretaker action is otherwise approved. |
 | OUT OF SCOPE | Unrelated workloads, services, tasks, collectors, firewall, remote access, security policy, drivers, OS repair, or broad cleanup | Obtain separate specific approval before acting. Do not infer authority from repeated observation or caretaker approval. |
 
-The canonical manifest is `config/caretaker.json`; do not create a second desired-state or deployment checklist. `config/GOLIATH.md` stores user-provided preferences separately from verified machine facts; it is not another desired-state source. The caretaker CLI is `powershell -NoProfile -File .\scripts\caretaker.ps1 status|doctor|snapshot|tick`; setup actions are `scripts/setup.ps1 -Action Plan|Install|Pause|Uninstall`; lease actions are `scripts/lease.ps1 -Action Status|Start|Stop|Expiry`; retention actions are `scripts/retention.ps1 -Action Plan|Apply`. Keep docs aligned with actual runtime behavior and label planned behavior clearly.
+The canonical manifest is `config/caretaker.json`; do not create a second desired-state or deployment checklist. `config/GOLIATH.md` stores user-provided preferences separately from verified machine facts; it is not another desired-state source. The caretaker CLI includes `status|doctor|snapshot|tick` and on-demand analysis actions as implemented; setup actions are `scripts/setup.ps1 -Action Plan|Install|Pause|Uninstall`; lease actions are `scripts/lease.ps1 -Action Status|Start|Stop|Expiry`; retention actions are `scripts/retention.ps1 -Action Plan|Apply`. Keep docs aligned with actual runtime behavior and label planned behavior clearly.

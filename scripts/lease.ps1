@@ -313,10 +313,28 @@ function Invoke-CaretakerLeaseExpiry {
 
 function Add-LeaseCommandLog {
   param([string]$Label, [string]$Command, [string]$Reason, [string]$Output)
+  if ($Label -eq 'lease evidence budget preflight') { return }
+  if ($Label -eq 'lease status invocation' -and $Output -notmatch '^ERROR:') { return }
+  if ($Label -in @('lease task query', 'lease owner identity') -and $Output -match '^(state=|pid=|files=)') { return }
   $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
   $logPath = Join-Path $projectRoot 'diag_log.txt'
   $stamp = Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'
-  [System.IO.File]::AppendAllText($logPath, "`r`n[$stamp] $Label`r`nCOMMAND: $Command`r`nREASON: $Reason`r`nOUTPUT:`r`n$Output`r`n", (New-Object System.Text.UTF8Encoding($false)))
+  if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -ge 1048576) {
+    Move-Item -LiteralPath $logPath -Destination ($logPath + '.1') -Force
+  }
+  $detail = 'completed'
+  if ($Label -in @('lease task query', 'lease owner identity')) { $detail = 'query failed' }
+  elseif ($Label -eq 'lease expiry arm' -and $Output -ne 'Task registration returned successfully.') { $detail = 'arm failed' }
+  elseif ($Label -eq 'lease expiry removal' -and $Output -ne 'Task unregistration returned successfully.') { $detail = 'removal failed' }
+  elseif ($Output -match '^ERROR:') { $detail = 'failed' }
+  elseif ($Output -match 'exitCode=([0-9]+)') { $detail = 'exitCode=' + $matches[1] }
+  elseif ($Output -match '^\s*\{') {
+    try {
+      $result = $Output | ConvertFrom-Json -ErrorAction Stop
+      if ($result.state) { $detail = 'state=' + [string]$result.state }
+    } catch { $detail = 'completed; result unreadable' }
+  }
+  [System.IO.File]::AppendAllText($logPath, "`r`n[$stamp] $Label; outcome=$detail`r`n", (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Invoke-LeaseLogman {

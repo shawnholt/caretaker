@@ -33,8 +33,13 @@ if ($FixtureMode) {
 
 function Write-RetentionLog {
   param([string]$Label, [string]$Command, [string]$Reason, [string]$Output)
+  if ($Label -eq 'Retention plan' -and $Output -notmatch 'OVER_BUDGET|UNKNOWN') { return }
   $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
-  Add-Content -LiteralPath $script:LogPath -Value "`r`n[$stamp] $Label`r`nCOMMAND: $Command`r`nREASON: $Reason`r`nOUTPUT:`r`n$Output"
+  if ((Test-Path -LiteralPath $script:LogPath) -and (Get-Item -LiteralPath $script:LogPath).Length -ge 1048576) {
+    Move-Item -LiteralPath $script:LogPath -Destination ($script:LogPath + '.1') -Force
+  }
+  $detail = if ($Output.Length -gt 500) { $Output.Substring(0, 500) + ' [truncated]' } else { $Output }
+  Add-Content -LiteralPath $script:LogPath -Value "`r`n[$stamp] $Label; outcome=$detail"
 }
 
 function Get-RetentionData {
@@ -170,9 +175,14 @@ function Invoke-RetentionApply {
   }
   $summary = Get-Summary -Data $after -ActionName 'Apply' -RemovedRows $removed
   $json = ConvertTo-Json -InputObject $summary -Depth 6
-  Write-RetentionLog -Label 'Routine retention' -Command 'powershell.exe -NoProfile -File .\scripts\retention.ps1 -Action Apply' -Reason 'Trim only expired parseable changes.jsonl rows, write the due marker, preserve protected state, and report budget state.' -Output $json
-  if (-not $FixtureMode) {
+  if ($removed -gt 0 -or $summary.state -ne 'OK') {
+    Write-RetentionLog -Label 'Routine retention' -Command 'powershell.exe -NoProfile -File .\scripts\retention.ps1 -Action Apply' -Reason 'Trim only expired parseable changes.jsonl rows, write the due marker, preserve protected state, and report budget state.' -Output $json
+  }
+  if (-not $FixtureMode -and ($removed -gt 0 -or $summary.state -ne 'OK')) {
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
+    if ((Test-Path -LiteralPath $script:ChangeLogPath) -and (Get-Item -LiteralPath $script:ChangeLogPath).Length -ge 1048576) {
+      Move-Item -LiteralPath $script:ChangeLogPath -Destination ($script:ChangeLogPath + '.1') -Force
+    }
     Add-Content -LiteralPath $script:ChangeLogPath -Value "`r`n[$stamp] Routine evidence retention`r`nFILES/COMMANDS: scripts/retention.ps1 -Action Apply; evidence/changes.jsonl; evidence/retention-state.json`r`nOUTCOME: Removed $removed expired valid change rows; state=$($summary.state); other runtime evidence preserved.`r`nROLLBACK: Restore changes.jsonl and retention-state.json from a separately preserved copy if needed; this action creates no archive."
   }
   return $summary
