@@ -1,0 +1,18 @@
+# Local diagnostic logs and project change history
+/diag_log.txt
+/diag_log-old.txt
+/change_log.txt
+
+# Private or generated evidence. Keep reports outside version control.
+/evidence/
+/artifacts/
+
+# Raw traces, event logs, packet captures, dumps, and exported XML reports
+*.etl
+*.blg
+*.evtx
+*.dmp
+*.dump
+*.pcap
+*.pcapng
+*.xml

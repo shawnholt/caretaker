@@ -1,0 +1,62 @@
+{
+    "schemaVersion":  1,
+    "product":  {
+                    "name":  "GoliathCaretaker",
+                    "release":  1
+                },
+    "deployment":  {
+                       "installed":  true,
+                       "taskEnabled":  true,
+                       "collectorEnabled":  false,
+                       "taskName":  "GoliathCaretaker-R1",
+                       "checkIntervalMinutes":  15,
+                       "perfmon":  {
+                                       "enabled":  false,
+                                       "collectorName":  "GoliathCaretaker-R1-PerfMon",
+                                       "sampleIntervalSeconds":  15,
+                                       "circularMaxMiB":  512,
+                                       "format":  "bincirc",
+                                       "counterResolution":  "one local sample passed 2026-09-23; 5 configured paths matched 31 expanded samples; continuous sampling, active disk instances, and rollover remain pending",
+                                       "counterPaths":  [
+                                                            "\\Processor(*)\\% Processor Time",
+                                                            "\\Memory\\Available MBytes",
+                                                            "\\PhysicalDisk(*)\\Disk Bytes/sec",
+                                                            "\\PhysicalDisk(*)\\Avg. Disk sec/Transfer",
+                                                            "\\PhysicalDisk(*)\\Avg. Disk Queue Length"
+                                                        ]
+                                   },
+                       "runtimeAcceptance":  "TASK_ONLY PILOT; 24-hour overhead unmeasured; continuous PerfMon disabled",
+                       "pilotProfile":  {
+                                            "status":  "PILOT",
+                                            "profiledAtLocal":  "2026-09-23 17:07 EDT",
+                                            "snapshotWallSeconds":  5.25,
+                                            "snapshotProcessCpuSeconds":  3.14,
+                                            "logicalProcessors":  20,
+                                            "estimatedWholeMachineCpuPercentAtFifteenMinuteCadence":  0.017,
+                                            "peakMemoryBytes":  null,
+                                            "limitations":  "One on-demand snapshot profile only; representative 15-minute cadence, peak memory, and 24-hour resource use are not established. Continuous PerfMon is disabled."
+                                        },
+                       "retentionDays":  30,
+                       "retentionRunIntervalHours":  24,
+                       "storageBudgetMiB":  1024
+                   },
+    "notifications":  {
+                          "mode":  "local",
+                          "deliveryEnabled":  false
+                      },
+    "leasePolicy":  {
+                        "captureLaunchEnabled":  false,
+                        "requireIndependentExpiry":  true,
+                        "defaultDurationSeconds":  60,
+                        "maximumDurationSeconds":  300,
+                        "expiryTaskName":  null
+                    },
+    "desired":  {
+                    "approvedWorkloads":  [
+
+                                          ],
+                    "listeners":  [
+
+                                  ]
+                }
+}
