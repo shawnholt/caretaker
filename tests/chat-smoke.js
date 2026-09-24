@@ -1,10 +1,24 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { boundedEvidence, validHost, validPost, nameQuery, callCaretakerTool, CodexSession,
   resolveCodexExe, resolveNpmWrapperCodexExe } = require('../scripts/chat-server.js');
+
+test('chat page prioritizes accessible questions and evidence provenance', () => {
+  const page = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'chat-page.html'), 'utf8');
+  for (const fragment of [
+    'Do you see anything that could be slowing the system down?',
+    'aria-label="Caretaker conversation"', 'aria-live="polite"', 'Ctrl + Enter to send',
+    'max-width: 760px', 'id="stop" class="stop" type="button">Stop chat',
+    "fetch('/summary', { cache: 'no-store', headers: { 'x-caretaker-csrf': csrf } })",
+    'Snapshot captured (UTC)', 'Collection coverage',
+    'point-in-time context. It does not describe live system status',
+    'No fresh Caretaker checks used.', 'check?.completed === true', "typeof check?.state === 'string'",
+  ]) assert.ok(page.includes(fragment), `chat page should include ${fragment}`);
+});
 
 test('chat evidence is bounded, historical, and omits raw private fields', () => {
   const fixture = path.join(__dirname, 'fixtures', 'chat-snapshot.json');

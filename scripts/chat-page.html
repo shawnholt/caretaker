@@ -2,40 +2,124 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Caretaker chat</title>
+<title>Goliath Caretaker chat</title>
 <style nonce="caretaker">
-  :root { font: 16px/1.5 system-ui, sans-serif; color-scheme: dark; background: #111827; color: #e5e7eb }
-  body { max-width: 760px; margin: 0 auto; padding: 1.5rem }
-  h1 { font-size: 1.35rem; margin: 0 }
-  .sub { color: #9ca3af; margin: .25rem 0 1rem }
-  #transcript { min-height: 45vh; max-height: 65vh; overflow: auto; border: 1px solid #374151; border-radius: .6rem; padding: 1rem }
-  .entry { overflow-wrap: anywhere; margin: 0 0 1rem }
-  .who { display: block; font-weight: 700; color: #93c5fd }
-  .user .who { color: #a7f3d0 }
-  form { margin-top: 1rem }
-  .controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .75rem; align-items: end; margin-bottom: .75rem }
-  select, textarea { box-sizing: border-box; width: 100%; padding: .7rem; border-radius: .5rem; border: 1px solid #6b7280; background: #1f2937; color: inherit; font: inherit }
-  textarea { min-height: 6rem; resize: vertical }
+  :root { font: 16px/1.5 system-ui, sans-serif; color-scheme: dark; background: #0b1220; color: #e5e7eb; --panel: #111c2d; --line: #29384c; --muted: #9aa9bc; --blue: #7dd3fc }
+  * { box-sizing: border-box }
+  body { max-width: 1180px; margin: 0 auto; padding: 1.5rem }
+  button, select, textarea { font: inherit }
+  button:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid #fbbf24; outline-offset: 2px }
+  .skip { position: absolute; left: -9999px; top: 0; padding: .5rem; background: #fff; color: #111827; z-index: 2 }
+  .skip:focus { left: .5rem }
+  header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; align-items: center; margin-bottom: 1.2rem }
+  h1 { font-size: 1.35rem; line-height: 1.2; margin: 0 }
+  .sub { color: var(--muted); margin: .35rem 0 0 }
+  .header-actions { display: flex; align-items: end; gap: .65rem }
+  label { display: block; font-size: .9rem; font-weight: 650 }
+  select, textarea { width: 100%; padding: .7rem .8rem; border-radius: .55rem; border: 1px solid #526176; background: #0d1727; color: inherit }
+  select { min-width: 180px; margin-top: .25rem }
   select:disabled { opacity: .7 }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 275px; gap: 1rem; align-items: start }
+  .chat, aside { border: 1px solid var(--line); border-radius: .8rem; background: var(--panel) }
+  .chat { min-width: 0; padding: 1rem }
+  #transcript { min-height: 34vh; max-height: 48vh; overflow: auto; padding: .5rem .25rem 1rem; scroll-behavior: smooth }
+  .welcome { padding: 1.25rem .5rem; color: var(--muted) }
+  .welcome strong { display: block; color: #e5e7eb; font-size: 1.05rem; margin-bottom: .2rem }
+  .entry { overflow-wrap: anywhere; margin: 0 0 1rem; padding: .85rem 1rem; border: 1px solid var(--line); border-radius: .7rem; background: #0d1727 }
+  .entry.user { border-color: #27514b; background: #102522 }
+  .who { display: block; font-weight: 750; color: var(--blue); margin-bottom: .25rem }
+  .user .who { color: #86efac }
+  .answer-meta { color: var(--muted); font-size: .82rem; margin-top: .65rem; border-top: 1px solid var(--line); padding-top: .45rem }
+  .composer { border-top: 1px solid var(--line); padding-top: 1rem }
+  .composer-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: .4rem; margin-bottom: .4rem }
+  .composer-head label { font-size: 1rem }
+  .hint { color: var(--muted); font-size: .82rem }
+  textarea { min-height: 6.5rem; resize: vertical; line-height: 1.5 }
+  .composer-actions { display: flex; justify-content: space-between; align-items: center; gap: .75rem; margin-top: .65rem }
+  button { padding: .6rem 1rem; border: 0; border-radius: .5rem; background: #7dd3fc; color: #071321; font-weight: 750; cursor: pointer }
+  button:hover:not(:disabled) { background: #bae6fd }
+  button:disabled { opacity: .55; cursor: wait }
+  .secondary { background: #26374d; color: #e5e7eb; border: 1px solid #465a72 }
+  .secondary:hover:not(:disabled) { background: #344a64 }
+  .stop { background: #3b2630; color: #fecdd3; border: 1px solid #77404b }
+  .stop:hover:not(:disabled) { background: #58313d }
+  #status { color: #fcd34d; min-height: 1.5rem; margin: .6rem 0 0 }
+  aside { padding: 1rem }
+  aside h2 { font-size: 1rem; margin: 0 }
+  .panel-intro { color: var(--muted); font-size: .86rem; margin: .25rem 0 .8rem }
+  .snapshot-label { display: inline-block; padding: .2rem .5rem; border-radius: 1rem; background: #382f1d; color: #fcd34d; font-size: .76rem; font-weight: 750; letter-spacing: .02em; text-transform: uppercase }
+  .fact { margin: .75rem 0 }
+  .fact dt, .fact-label { color: var(--muted); font-size: .78rem }
+  .fact dd { margin: .12rem 0 0; overflow-wrap: anywhere; font-size: .9rem }
+  #coverage { list-style: none; padding: 0; margin: .25rem 0 0; display: grid; gap: .25rem }
+  #coverage li { display: flex; justify-content: space-between; gap: .5rem; font-size: .82rem }
+  #coverage li span:last-child { color: var(--muted); text-align: right }
+  .examples { border-top: 1px solid var(--line); margin-top: .9rem; padding-top: .75rem }
+  .examples h3 { font-size: .86rem; margin: 0 0 .45rem; color: var(--muted) }
+  .example-list { display: grid; gap: .4rem }
+  .example-list button { text-align: left; font-size: .82rem; line-height: 1.35; padding: .55rem .65rem }
   .md p { margin: .45rem 0 }
   .md ul, .md ol { margin: .35rem 0; padding-left: 1.5rem }
   .md pre { overflow-x: auto; padding: .7rem; border-radius: .4rem; background: #1f2937 }
   .md code { padding: .08rem .25rem; border-radius: .2rem; background: #1f2937; font-family: ui-monospace, monospace }
   .md pre code { padding: 0; background: transparent }
-  @media (max-width: 480px) { body { padding: 1rem } .controls { grid-template-columns: 1fr } }
-  button { margin-top: .5rem; padding: .55rem 1rem; border: 0; border-radius: .4rem; background: #60a5fa; color: #111827; font-weight: 700; cursor: pointer }
-  button:disabled { opacity: .55; cursor: wait }
-  #status { color: #fbbf24; min-height: 1.5rem }
+  @media (max-width: 760px) { body { padding: 1rem } .layout { grid-template-columns: 1fr } aside { order: 2 } #transcript { min-height: 30vh; max-height: 55vh } }
+  @media (max-width: 480px) { body { padding: .75rem } header { align-items: stretch } .header-actions { width: 100%; justify-content: space-between; align-items: end } select { min-width: 0 } .chat { padding: .75rem } .composer-actions { align-items: stretch; flex-direction: column-reverse } .composer-actions button { width: 100% } }
 </style>
 <body>
-  <h1>Goliath Caretaker chat</h1>
-  <p class="sub">Ask about Goliath's current state. Replies use live, read-only caretaker evidence; anything unavailable is reported as UNKNOWN.</p>
-  <div id="transcript" role="log" aria-live="polite"></div>
-  <form id="form">
-    <div class="controls"><label for="model">Model<select id="model" disabled><option>Loading models…</option></select></label><button id="stop" type="button">Stop chat</button></div>
-    <label for="message">Your question</label><textarea id="message" maxlength="3000" required placeholder="What is Goliath doing right now?"></textarea><button id="send" disabled>Send</button>
-  </form>
-  <p id="status" role="status"></p>
+  <a class="skip" href="#message">Skip to question</a>
+  <header>
+    <div>
+      <h1>Goliath Caretaker</h1>
+      <p class="sub">Ask a question. Caretaker evidence is read-only; missing evidence stays UNKNOWN.</p>
+    </div>
+    <div class="header-actions">
+      <label for="model">Model<select id="model" disabled><option>Loading models…</option></select></label>
+      <button id="stop" class="stop" type="button">Stop chat</button>
+    </div>
+  </header>
+  <main class="layout">
+    <section class="chat" aria-label="Caretaker conversation">
+      <div id="transcript" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Chat answers and questions">
+        <div class="welcome" id="welcome"><strong>What would you like to know?</strong>Ask about current activity, resource use, a process, or recent system events. Replies should identify evidence time and coverage.</div>
+      </div>
+      <form id="form" class="composer">
+        <div class="composer-head">
+          <label for="message">Your question</label>
+          <span class="hint">Ctrl + Enter to send</span>
+        </div>
+        <textarea id="message" maxlength="3000" required aria-describedby="question-hint" placeholder="Ask about Goliath's current state…"></textarea>
+        <div class="composer-actions">
+          <span id="question-hint" class="hint">Current questions use read-only Caretaker checks. The saved snapshot is historical context.</span>
+          <button id="send" type="submit" disabled>Ask Caretaker</button>
+        </div>
+        <p id="status" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+    <aside aria-labelledby="evidence-title">
+      <span class="snapshot-label">Historical context</span>
+      <h2 id="evidence-title">Saved evidence</h2>
+      <p class="panel-intro">This saved snapshot is point-in-time context. It does not describe live system status.</p>
+      <dl>
+        <div class="fact"><dt>Snapshot captured (UTC)</dt><dd id="captured-at">UNKNOWN</dd></div>
+        <div class="fact"><dt>Summary checked (UTC)</dt><dd id="summary-at">UNKNOWN</dd></div>
+      </dl>
+      <div class="fact">
+        <span id="coverage-label" class="fact-label">Collection coverage</span>
+        <ul id="coverage" aria-labelledby="coverage-label" aria-live="polite"><li><span>Overall</span><span>UNKNOWN</span></li></ul>
+      </div>
+      <button id="refresh-summary" class="secondary" type="button">Refresh saved evidence</button>
+      <p id="summary-status" class="hint" role="status" aria-live="polite">Loading saved evidence…</p>
+      <div class="examples" aria-labelledby="examples-title">
+        <h3 id="examples-title">Try asking</h3>
+        <div class="example-list">
+          <button type="button" class="secondary example" data-prompt="Do you see anything that could be slowing the system down?">Do you see anything that could be slowing the system down?</button>
+          <button type="button" class="secondary example" data-prompt="What is using the most memory right now? Include the sample time and coverage.">What is using the most memory right now?</button>
+          <button type="button" class="secondary example" data-prompt="What recent system events need attention?">What recent system events need attention?</button>
+        </div>
+      </div>
+    </aside>
+  </main>
   <script nonce="caretaker">
     const csrf = '__CSRF_TOKEN__';
     const form = document.getElementById('form');
@@ -44,7 +128,13 @@
     const stop = document.getElementById('stop');
     const model = document.getElementById('model');
     const transcript = document.getElementById('transcript');
+    const welcome = document.getElementById('welcome');
     const status = document.getElementById('status');
+    const capturedAt = document.getElementById('captured-at');
+    const summaryAt = document.getElementById('summary-at');
+    const coverage = document.getElementById('coverage');
+    const summaryStatus = document.getElementById('summary-status');
+    const refreshSummary = document.getElementById('refresh-summary');
     let closing = false;
     function appendInline(parent, text) {
       const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
@@ -94,14 +184,75 @@
       if (code) parent.append(code.pre);
       flushParagraph(); flushList();
     }
-    function add(who, message, klass, markdown = false) {
+    function add(who, message, klass, markdown = false, receivedAt = '', checks = null) {
+      if (welcome?.isConnected) welcome.remove();
       const entry = document.createElement('div'); entry.className = 'entry ' + klass;
       const title = document.createElement('span'); title.className = 'who'; title.textContent = who;
       entry.append(title);
-      if (markdown) { const body = document.createElement('div'); body.className = 'md'; renderMarkdown(body, message); entry.append(body); }
-      else entry.append(document.createTextNode(message));
+      if (markdown) {
+        const body = document.createElement('div'); body.className = 'md'; renderMarkdown(body, message); entry.append(body);
+        const meta = document.createElement('div'); meta.className = 'answer-meta';
+        const received = document.createElement('div'); received.textContent = `Reply received (local time): ${receivedAt}.`;
+        meta.append(received);
+        const evidence = document.createElement('div'); evidence.textContent = 'Fresh Caretaker checks: ';
+        if (!Array.isArray(checks) || checks.length === 0) {
+          evidence.append(document.createTextNode('No fresh Caretaker checks used.'));
+        } else {
+          const list = document.createElement('ul');
+          for (const check of checks) {
+            const item = document.createElement('li');
+            const toolNames = { resources: 'Resource sample', process_details: 'Process details', event_health: 'Recent event health', inventory: 'Inventory', caretaker_status: 'Caretaker status' };
+            const label = toolNames[check?.tool] || (typeof check?.tool === 'string' ? check.tool : 'Check');
+            const completed = check?.completed === true;
+            const state = typeof check?.state === 'string' ? check.state : 'UNKNOWN';
+            item.textContent = `${label}: ${completed ? state : `Unavailable (${state})`} · ${utcLabel(check?.capturedAtUtc)}`;
+            list.append(item);
+          }
+          evidence.append(list);
+        }
+        meta.append(evidence); entry.append(meta);
+      } else entry.append(document.createTextNode(message));
       transcript.append(entry);
       transcript.scrollTop = transcript.scrollHeight;
+    }
+    function utcLabel(value) {
+      if (typeof value !== 'string' || !value || value === 'UNKNOWN') return 'UNKNOWN';
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : `${date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC')}`;
+    }
+    async function loadSummary() {
+      refreshSummary.disabled = true;
+      summaryStatus.textContent = 'Loading saved evidence…';
+      try {
+        const response = await fetch('/summary', { cache: 'no-store', headers: { 'x-caretaker-csrf': csrf } });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Saved evidence is unavailable.');
+        const snapshot = data.snapshot;
+        const saved = snapshot && typeof snapshot === 'object' ? snapshot : null;
+        capturedAt.textContent = saved ? utcLabel(saved.capturedAtUtc) : 'UNKNOWN';
+        summaryAt.textContent = utcLabel(data.generatedAtUtc);
+        const items = saved?.coverage && typeof saved.coverage === 'object' ? saved.coverage : null;
+        coverage.replaceChildren();
+        if (items) {
+          for (const [name, value] of Object.entries(items)) {
+            const row = document.createElement('li');
+            const key = document.createElement('span'); key.textContent = name;
+            const detail = document.createElement('span');
+            const state = typeof value?.status === 'string' ? value.status : 'UNKNOWN';
+            const count = Number.isSafeInteger(value?.count) ? ` · ${value.count} records` : '';
+            detail.textContent = `${state}${count}`;
+            row.append(key, detail); coverage.append(row);
+          }
+        }
+        if (!coverage.childElementCount) {
+          const row = document.createElement('li'); row.textContent = 'Coverage UNKNOWN'; coverage.append(row);
+        }
+        summaryStatus.textContent = saved ? 'Saved snapshot details; historical context only.' : 'Saved snapshot unavailable; evidence is UNKNOWN.';
+      } catch (error) {
+        capturedAt.textContent = 'UNKNOWN'; summaryAt.textContent = 'UNKNOWN';
+        coverage.replaceChildren(); const row = document.createElement('li'); row.textContent = 'Coverage UNKNOWN'; coverage.append(row);
+        summaryStatus.textContent = error.message || 'Saved evidence is unavailable.';
+      } finally { refreshSummary.disabled = closing; }
     }
     async function loadModels() {
       try {
@@ -127,35 +278,43 @@
     }
     form.addEventListener('submit', async event => {
       event.preventDefault();
-      const message = box.value.trim(); if (!message || model.disabled || !model.value) return;
+      const message = box.value.trim(); if (!message || model.disabled || !model.value || closing) return;
       add('You', message, 'user'); box.value = ''; send.disabled = true;
-      status.textContent = 'Codex is thinking…';
+      status.textContent = 'Caretaker is checking…';
       try {
         const response = await fetch('/chat', { method: 'POST', headers: {
           'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf },
           body: JSON.stringify({ message, model: model.value }), cache: 'no-store' });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Request failed.');
-        add('Codex', data.reply, 'assistant', true); status.textContent = '';
+        add('Caretaker', data.reply, 'assistant', true, new Date().toLocaleString(), data.checks); status.textContent = '';
       } catch (error) { status.textContent = error.message || 'Chat is unavailable.'; }
       finally { send.disabled = model.disabled || closing; box.focus(); }
     });
+    box.addEventListener('keydown', event => {
+      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); form.requestSubmit(); }
+    });
+    document.querySelectorAll('.example').forEach(button => button.addEventListener('click', () => {
+      if (closing) return; box.value = button.dataset.prompt || ''; box.focus(); box.setSelectionRange(box.value.length, box.value.length);
+    }));
+    refreshSummary.addEventListener('click', loadSummary);
     // pagehide also fires on reload, so the server waits briefly for the page to return before stopping.
     window.addEventListener('pagehide', () => {
       if (closing) return;
       fetch('/leave', { method: 'POST', keepalive: true, headers: {
         'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf }, body: '{}' }).catch(() => {});
     });
-    window.addEventListener('pageshow', event => { if (event.persisted && !closing) loadModels(); });
+    window.addEventListener('pageshow', event => { if (event.persisted && !closing) { loadModels(); loadSummary(); } });
     stop.addEventListener('click', async () => {
       if (closing) return; closing = true;
       try { await fetch('/close', { method: 'POST', headers: {
         'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf }, body: '{}' }); }
       catch {}
-      send.disabled = true; box.disabled = true; stop.disabled = true;
+      send.disabled = true; box.disabled = true; stop.disabled = true; refreshSummary.disabled = true;
       status.textContent = 'Chat stopped. Close this tab.';
     });
     loadModels();
+    loadSummary();
   </script>
 </body>
 </html>

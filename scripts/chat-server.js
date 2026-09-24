@@ -279,6 +279,35 @@ async function callCaretakerTool(name, args) {
   throw new Error('Tool is not available.');
 }
 
+function isSlowdownQuestion(message) {
+  return /\b(?:slow(?:ing|ly|ness)?|sluggish|lag(?:gy|ging)?|performance|freez(?:e|ing)|hang(?:ing)?|stutter(?:ing)?)\b/i.test(message);
+}
+
+function checkMetadata(tool, result, completed) {
+  return { tool,
+    capturedAtUtc: typeof result?.capturedAtUtc === 'string' ? result.capturedAtUtc : null,
+    state: completed ? (typeof result?.state === 'string' ? result.state
+      : typeof result?.coverage?.status === 'string' ? result.coverage.status : 'UNKNOWN') : 'UNAVAILABLE',
+    completed };
+}
+
+async function collectSlowdownEvidence(message, runCheck = callCaretakerTool) {
+  if (!isSlowdownQuestion(message)) return { checks: [], context: null };
+  const checks = [];
+  const results = {};
+  for (const tool of ['resources', 'event_health']) {
+    try {
+      const result = await runCheck(tool, {});
+      checks.push(checkMetadata(tool, result, true));
+      results[tool] = result;
+    } catch {
+      checks.push(checkMetadata(tool, null, false));
+      results[tool] = { state: 'UNKNOWN', reason: 'Caretaker check unavailable.' };
+    }
+  }
+  return { checks, context: boundedResult({ source: 'fresh Caretaker slowdown checks', results }, 16000) };
+}
+
 class CodexSession {
   constructor() {
     this.child = null;
@@ -289,6 +318,7 @@ class CodexSession {
     this.buffer = '';
     this.closed = false;
     this.models = [];
+    this.lastChecks = [];
   }
 
   async start() {
@@ -406,6 +436,7 @@ class CodexSession {
       if (msg.params.turn?.status !== 'completed' || msg.params.turn?.error) {
         active.reject(new Error('Codex could not complete this turn.'));
       } else {
+        this.lastChecks = active.checks || [];
         active.resolve(active.text || 'Codex returned no message.');
       }
     }
@@ -424,29 +455,32 @@ class CodexSession {
     try {
       const result = await callCaretakerTool(params.tool, params.arguments);
       if (this.turn !== active || this.closed) return;
+      active.checks.push(checkMetadata(params.tool, result, true));
       this.send({ id: msg.id, result: { success: true,
         contentItems: [{ type: 'inputText', text: JSON.stringify(result).slice(0, 12000) }] } });
     } catch (error) {
       if (this.turn !== active || this.closed) return;
+      active.checks.push(checkMetadata(params.tool, null, false));
       this.send({ id: msg.id, result: { success: false,
         contentItems: [{ type: 'inputText', text: (error.message || 'Caretaker check failed.').slice(0, 300) }] } });
     }
   }
 
-  async ask(message, model) {
+  async ask(message, model, prefetched = { checks: [], context: null }) {
     try { await this.start(); }
     catch (error) { this.close(); throw error; }
     if (this.turn) throw new Error('A reply is already in progress.');
+    this.lastChecks = [...prefetched.checks];
     const selectedModel = model || this.models.find(item => item.isDefault)?.id || this.models[0].id;
     if (!this.models.some(item => item.id === selectedModel)) throw new Error('Choose a model from the Codex model list.');
     const evidence = boundedEvidence();
-    const prefix = `You are Goliath Caretaker for this Windows workstation. Use the read-only Caretaker tools to check live system facts when the user asks about current status, resources, processes, listeners, services, tasks, startup, or recent events. Do not guess current state from the historical snapshot. State the capture time and coverage for measurements; if a tool fails or evidence is missing, say UNKNOWN. You cannot change OS state or run arbitrary commands. This saved summary is historical context only: ${JSON.stringify(evidence)}\n\nUser question: `;
+    const prefix = `You are Goliath Caretaker for this Windows workstation. Use the read-only Caretaker tools to check live system facts when the user asks about current status, resources, processes, listeners, services, tasks, startup, or recent events. A broad slowdown question includes fresh resources and recent event health below; use those results and call additional Caretaker tools only when they would clarify the answer. Explain that a short CPU sample cannot establish sustained load and that memory working set alone does not prove pressure. Missing disk latency, paging, or history is UNKNOWN rather than healthy. Separate measured facts from possible causes and suggest the next focused check when evidence is insufficient. Do not guess current state from the historical snapshot. State the capture time and coverage for measurements; if a tool fails or evidence is missing, say UNKNOWN. You cannot change OS state or run arbitrary commands. Saved summary (historical context only): ${JSON.stringify(evidence)}\nFresh checks for this question: ${JSON.stringify(prefetched.context || 'none')}\n\nUser question: `;
     const done = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.turn = null;
         reject(new Error('The reply timed out. Restart chat to try again.'));
       }, TURN_TIMEOUT);
-      this.turn = { text: '', resolve, reject, timer, id: null, toolCalls: 0 };
+      this.turn = { text: '', resolve, reject, timer, id: null, toolCalls: 0, checks: [...prefetched.checks] };
     });
     done.catch(() => {}); // A request failure may arrive before we await completion.
     try {
@@ -523,6 +557,13 @@ function main() {
       }
       return;
     }
+    if (req.method === 'GET' && req.url === '/summary') {
+      if (req.headers['x-caretaker-csrf'] !== token) {
+        json(res, 403, { error: 'Request rejected.' }); return;
+      }
+      json(res, 200, { snapshot: boundedEvidence(), generatedAtUtc: new Date().toISOString() });
+      return;
+    }
     if (req.method !== 'POST' || !['/chat', '/close', '/leave'].includes(req.url)) {
       json(res, 404, { error: 'Not found.' }); return;
     }
@@ -550,7 +591,10 @@ function main() {
         throw new Error('Choose a model from the list.');
       }
       turns++;
-      json(res, 200, { reply: await session.ask(parsed.message.trim(), parsed.model) });
+      const question = parsed.message.trim();
+      const prefetched = await collectSlowdownEvidence(question);
+      const reply = await session.ask(question, parsed.model, prefetched);
+      json(res, 200, { reply, checks: session.lastChecks });
     } catch (error) {
       json(res, 400, { error: error.message || 'Chat failed.' });
     } finally { busy = false; }
@@ -593,4 +637,5 @@ function main() {
 
 if (require.main === module) main();
 module.exports = { boundedEvidence, validHost, validPost, isolatedCodexArgs, compactInventory,
-  nameQuery, callCaretakerTool, CodexSession, resolveCodexExe, resolveNpmWrapperCodexExe, resolvePathCodexExe };
+  nameQuery, callCaretakerTool, isSlowdownQuestion, collectSlowdownEvidence, CodexSession,
+  resolveCodexExe, resolveNpmWrapperCodexExe, resolvePathCodexExe };

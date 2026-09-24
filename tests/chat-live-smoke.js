@@ -6,6 +6,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 async function main() {
+  const slowdown = process.argv.includes('--slowdown');
   const root = path.resolve(__dirname, '..');
   const child = spawn(process.execPath, [path.join(root, 'scripts', 'chat-server.js')], {
     cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], shell: false,
@@ -37,14 +38,19 @@ async function main() {
     const response = await fetch(url + 'chat', { method: 'POST', headers: {
       'content-type': 'application/json', origin: url.slice(0, -1), 'x-caretaker-csrf': token,
     }, body: JSON.stringify({ model: listing.selectedModel,
-      message: 'Check current system CPU and memory usage now with a fresh Caretaker sample. Report timestamp, overall system CPU percent, RAM used percent, and at least one current top CPU process.' }) });
+      message: slowdown ? 'Do you see anything that could be slowing the system down right now? Tell me what you checked, what you found, and what remains unknown.'
+        : 'Check current system CPU and memory usage now with a fresh Caretaker sample. Report timestamp, overall system CPU percent, RAM used percent, and at least one current top CPU process.' }) });
     const answer = await response.json();
     assert.equal(response.status, 200, answer.error);
     assert.ok(answer.reply?.length > 20, 'Codex returned an answer');
+    if (slowdown) {
+      assert.ok(answer.checks?.some(check => check.tool === 'resources' && check.completed), 'fresh resource check completed');
+      assert.ok(answer.checks?.some(check => check.tool === 'event_health' && check.completed), 'fresh event check completed');
+    }
     console.log(JSON.stringify({ models: listing.models.length, selectedModel: listing.selectedModel,
-      reply: answer.reply.slice(0, 1500) }));
+      checks: answer.checks, reply: answer.reply.slice(0, 2500) }));
     const otherModel = listing.models.find(item => item.id.includes('luna')) || listing.models.find(item => item.id !== listing.selectedModel);
-    if (otherModel) {
+    if (otherModel && !slowdown) {
       const secondResponse = await fetch(url + 'chat', { method: 'POST', headers: {
         'content-type': 'application/json', origin: url.slice(0, -1), 'x-caretaker-csrf': token,
       }, body: JSON.stringify({ model: otherModel.id,
