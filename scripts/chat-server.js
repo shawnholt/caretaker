@@ -1,16 +1,17 @@
 'use strict';
 
-// On-demand, local-only Caretaker chat. No background service or live diagnostics.
+// On-demand, local-only Caretaker chat with bounded, read-only live checks.
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawn, execFileSync } = require('node:child_process');
+const { spawn, execFile, execFileSync } = require('node:child_process');
 const readline = require('node:readline');
 
 const ROOT = path.resolve(__dirname, '..');
 const SNAPSHOT = path.join(ROOT, 'evidence', 'snapshot.json');
 const PAGE = path.join(__dirname, 'chat-page.html');
+const CARETAKER = path.join(__dirname, 'caretaker.ps1');
 const MAX_BODY = 8 * 1024;
 const MAX_MESSAGE = 3000;
 const MAX_REPLY = 12000;
@@ -18,6 +19,19 @@ const MAX_TURNS = 12;
 const TURN_TIMEOUT = 120000;
 const IDLE_TIMEOUT = 15 * 60 * 1000;
 const MODULES = ['processes', 'tcpListeners', 'udpEndpoints', 'services', 'tasks', 'startup'];
+const ACTIVE_CARETAKER_CHILDREN = new Set();
+const TOOL_DEFS = [
+  { name: 'resources', description: 'Take a fresh 1-second Windows process CPU and memory sample. Optionally search for a process by name. Use for current CPU, memory, resource hogs, or a named app.',
+    inputSchema: { type: 'object', properties: { processName: { type: 'string', description: 'Optional process name or distinctive substring, e.g. WorldOfWarshipsLegends.exe' } }, additionalProperties: false } },
+  { name: 'process_details', description: 'Check one current process by PID, including identity, verified ancestry when available, and bounded local endpoint evidence.',
+    inputSchema: { type: 'object', properties: { processId: { type: 'integer', minimum: 1, maximum: 2147483647 } }, required: ['processId'], additionalProperties: false } },
+  { name: 'event_health', description: 'Read focused recent Windows System and Application event health categories with coverage; no changes are made.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'inventory', description: 'Capture a fresh, bounded Windows inventory of processes, listeners, services, tasks and startup items, then return a selected section. Use when current inventory or change context is needed.',
+    inputSchema: { type: 'object', properties: { section: { type: 'string', enum: MODULES }, query: { type: 'string', description: 'Optional name or port substring to find within the selected section' } }, required: ['section'], additionalProperties: false } },
+  { name: 'caretaker_status', description: 'Read the Caretaker checker status, freshness, and coverage without changing the Windows task.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+];
 
 function boundedEvidence(file = SNAPSHOT) {
   try {
@@ -103,6 +117,109 @@ function json(res, status, value) {
   res.end(body);
 }
 
+function nameQuery(value) {
+  if (value === undefined || value === '') return '';
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_. -]{1,80}$/.test(value)) {
+    throw new Error('Use a short process name, service name, task name, or port.' );
+  }
+  return value;
+}
+
+function runCaretaker(action, params = [], timeout = 35000) {
+  return new Promise((resolve, reject) => {
+    const child = execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', CARETAKER, action, ...params], { cwd: ROOT, windowsHide: true, shell: false,
+      timeout, maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
+      ACTIVE_CARETAKER_CHILDREN.delete(child);
+      if (error) reject(new Error(`Caretaker ${action} check was unavailable.`));
+      else resolve(stdout.trim());
+    });
+    ACTIVE_CARETAKER_CHILDREN.add(child);
+    child.stdin?.end();
+  });
+}
+
+function compactProcess(row) {
+  return { name: row?.name || 'UNKNOWN', pid: row?.pid ?? null,
+    cpuPercentOneCore: row?.cpuPercentOneCore ?? null,
+    workingSetMiB: Number.isFinite(row?.workingSetBytes) ? Math.round(row.workingSetBytes / 1048576) : null,
+    attributionState: row?.attributionState || 'UNKNOWN' };
+}
+
+function boundedResult(value, limit = 10000) {
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= limit) return value;
+  return { state: value?.state || 'UNKNOWN', capturedAtUtc: value?.capturedAtUtc || 'UNKNOWN',
+    truncated: true, excerpt: serialized.slice(0, limit) };
+}
+
+function compactInventory(section, query = '') {
+  const stat = fs.statSync(SNAPSHOT);
+  if (stat.size > 2 * 1024 * 1024) throw new Error('Caretaker inventory exceeded the local evidence limit.');
+  const data = JSON.parse(fs.readFileSync(SNAPSHOT, 'utf8'));
+  const rows = data.observed?.[section];
+  const coverage = data.coverage?.[section] || { status: 'UNKNOWN', count: null };
+  if (!Array.isArray(rows)) return { capturedAtUtc: data.capturedAtUtc || 'UNKNOWN', section, coverage, rows: 'UNKNOWN' };
+  const mapped = rows.map(row => {
+    if (section === 'processes') return { name: row.name, pid: row.pid,
+      workingSetMiB: Number.isFinite(row.workingSetBytes) ? Math.round(row.workingSetBytes / 1048576) : null };
+    if (section === 'tcpListeners' || section === 'udpEndpoints') return { protocol: row.protocol,
+      port: row.localPort, bind: ['127.0.0.1', '::1'].includes(row.localAddress) ? 'loopback'
+        : ['0.0.0.0', '::'].includes(row.localAddress) ? 'wildcard' : 'specific',
+      process: row.process?.name || 'UNKNOWN', pid: row.process?.pid ?? null };
+    if (section === 'services') return { name: row.name, displayName: row.displayName,
+      state: row.state, startMode: row.startMode };
+    if (section === 'tasks') return { name: row.name, path: row.path, state: row.state, enabled: row.enabled };
+    return { name: row.name, location: row.location, user: row.user };
+  });
+  const needle = query.toLowerCase();
+  const filtered = needle ? mapped.filter(row => JSON.stringify(row).toLowerCase().includes(needle)) : mapped;
+  if (section === 'processes' && !needle) filtered.sort((a, b) => (b.workingSetMiB || 0) - (a.workingSetMiB || 0));
+  return { capturedAtUtc: data.capturedAtUtc || 'UNKNOWN', section, coverage, query,
+    matchingCount: filtered.length, rows: filtered.slice(0, 20) };
+}
+
+async function callCaretakerTool(name, args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Invalid tool arguments.');
+  if (name === 'resources') {
+    if (Object.keys(args).some(key => key !== 'processName')) throw new Error('Invalid resource arguments.');
+    const processName = nameQuery(args.processName);
+    const raw = await runCaretaker('busy', ['-SampleSeconds', '1', '-Top', '10', ...(processName ? ['-ProcessName', processName] : [])]);
+    const data = JSON.parse(raw);
+    return { capturedAtUtc: data.capturedAtUtc, state: data.state, coverage: data.coverage,
+      sample: data.sample || { elapsedSeconds: data.sampleSeconds, cpuUnit: 'percent of one logical CPU' },
+      systemCpu: data.systemCpu || { state: 'UNKNOWN', percent: null },
+      memory: { state: data.memory?.state, usedPercent: data.memory?.usedPercent,
+        totalGiB: Number.isFinite(data.memory?.totalBytes) ? +(data.memory.totalBytes / 1073741824).toFixed(1) : null,
+        freeGiB: Number.isFinite(data.memory?.freeBytes) ? +(data.memory.freeBytes / 1073741824).toFixed(1) : null,
+        topConsumers: (data.memory?.topConsumers || []).map(compactProcess) },
+      topCpuProcesses: (data.processes || []).map(compactProcess), requestedProcessName: processName,
+      namedProcesses: (data.namedProcesses || []).map(compactProcess), reason: data.reason || null };
+  }
+  if (name === 'process_details') {
+    if (Object.keys(args).length !== 1 || !Number.isSafeInteger(args.processId) || args.processId < 1 || args.processId > 2147483647) throw new Error('A valid process ID is required.');
+    const data = JSON.parse(await runCaretaker('explain', ['-ProcessId', String(args.processId)]));
+    return boundedResult(data);
+  }
+  if (name === 'event_health') {
+    if (Object.keys(args).length) throw new Error('Invalid event arguments.');
+    const data = JSON.parse(await runCaretaker('events', ['-WindowDays', '7', '-MaxEventsPerLog', '100']));
+    return boundedResult(data);
+  }
+  if (name === 'inventory') {
+    if (Object.keys(args).some(key => !['section', 'query'].includes(key)) || !MODULES.includes(args.section)) throw new Error('A valid inventory section is required.');
+    const query = nameQuery(args.query);
+    await runCaretaker('snapshot');
+    return compactInventory(args.section, query);
+  }
+  if (name === 'caretaker_status') {
+    if (Object.keys(args).length) throw new Error('Invalid status arguments.');
+    const output = await runCaretaker('status');
+    return { source: 'fresh Caretaker status check', output: output.slice(0, 8000) };
+  }
+  throw new Error('Tool is not available.');
+}
+
 class CodexSession {
   constructor() {
     this.child = null;
@@ -112,6 +229,7 @@ class CodexSession {
     this.turn = null;
     this.buffer = '';
     this.closed = false;
+    this.models = [];
   }
 
   async start() {
@@ -129,15 +247,24 @@ class CodexSession {
     lines.on('line', line => this.onLine(line));
     child.stderr.on('data', () => {}); // Drain, but never expose private diagnostics.
     await this.request('initialize', { clientInfo: { name: 'goliath_caretaker_chat',
-      title: 'Goliath Caretaker Chat', version: '0.1.0' } }, 10000);
+      title: 'Goliath Caretaker Chat', version: '0.2.0' },
+    capabilities: { experimentalApi: true } }, 10000);
     this.send({ method: 'initialized', params: {} });
     const auth = await this.request('account/read', { refreshToken: false }, 10000);
     if (auth?.account?.type !== 'chatgpt') {
       throw new Error('Sign in to Codex with ChatGPT before using chat.');
     }
+    const listed = await this.request('model/list', { limit: 50, includeHidden: false }, 10000);
+    if (!Array.isArray(listed?.data)) throw new Error('Codex did not provide a model list.');
+    this.models = listed.data.filter(item => typeof item?.model === 'string' && item.model &&
+      typeof item.displayName === 'string' && item.hidden !== true).map(item => ({
+        id: item.model, displayName: item.displayName, isDefault: item.isDefault === true,
+      }));
+    if (!this.models.length) throw new Error('No chat models are available in Codex.');
     const started = await this.request('thread/start', {
       cwd: ROOT, approvalPolicy: 'never', sandbox: 'read-only',
       personality: 'friendly', serviceName: 'goliath_caretaker_chat',
+      dynamicTools: TOOL_DEFS,
     }, 15000);
     if (typeof started?.thread?.id !== 'string') throw new Error('Codex did not return a thread ID.');
     this.threadId = started.thread.id;
@@ -176,6 +303,9 @@ class CodexSession {
     if (line.length > 1024 * 1024) { this.fail(new Error('Codex response exceeded the limit.')); return; }
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
+    if (msg.method === 'item/tool/call' && msg.id !== undefined && msg.id !== null) {
+      void this.handleToolCall(msg); return;
+    }
     if (msg.id !== undefined && msg.id !== null) {
       const pending = this.pending.get(msg.id);
       if (!pending) return;
@@ -193,6 +323,7 @@ class CodexSession {
       if (typeof text === 'string') this.turn.text = text.slice(0, MAX_REPLY);
     } else if (msg.method === 'turn/completed') {
       const active = this.turn;
+      if (active.id && msg.params.turn?.id !== active.id) return;
       this.turn = null;
       clearTimeout(active.timer);
       if (msg.params.turn?.status !== 'completed' || msg.params.turn?.error) {
@@ -203,28 +334,55 @@ class CodexSession {
     }
   }
 
-  async ask(message) {
+  async handleToolCall(msg) {
+    const params = msg.params || {};
+    const active = this.turn;
+    if (!active || params.threadId !== this.threadId || !params.turnId ||
+        (active.id && params.turnId !== active.id) || active.toolCalls >= 6) {
+      if (this.child && !this.closed) this.send({ id: msg.id, result: { success: false,
+        contentItems: [{ type: 'inputText', text: 'Caretaker tool call is unavailable for this turn.' }] } });
+      return;
+    }
+    if (!active.id) active.id = params.turnId;
+    active.toolCalls++;
+    try {
+      const result = await callCaretakerTool(params.tool, params.arguments);
+      if (this.turn !== active || this.closed) return;
+      this.send({ id: msg.id, result: { success: true,
+        contentItems: [{ type: 'inputText', text: JSON.stringify(result).slice(0, 12000) }] } });
+    } catch (error) {
+      if (this.turn !== active || this.closed) return;
+      this.send({ id: msg.id, result: { success: false,
+        contentItems: [{ type: 'inputText', text: (error.message || 'Caretaker check failed.').slice(0, 300) }] } });
+    }
+  }
+
+  async ask(message, model) {
     try { await this.start(); }
     catch (error) { this.close(); throw error; }
     if (this.turn) throw new Error('A reply is already in progress.');
+    const selectedModel = model || this.models.find(item => item.isDefault)?.id || this.models[0].id;
+    if (!this.models.some(item => item.id === selectedModel)) throw new Error('Choose a model from the Codex model list.');
     const evidence = boundedEvidence();
-    const prefix = `Use only the provided saved snapshot summary. It is historical, not live. Do not use tools, inspect files, or claim current system status. If evidence is unavailable, say UNKNOWN. Snapshot summary: ${JSON.stringify(evidence)}\n\nQuestion: `;
+    const prefix = `You are Goliath Caretaker for this Windows workstation. Use the read-only Caretaker tools to check live system facts when the user asks about current status, resources, processes, listeners, services, tasks, startup, or recent events. Do not guess current state from the historical snapshot. State the capture time and coverage for measurements; if a tool fails or evidence is missing, say UNKNOWN. You cannot change OS state or run arbitrary commands. This saved summary is historical context only: ${JSON.stringify(evidence)}\n\nUser question: `;
     const done = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.turn = null;
         reject(new Error('The reply timed out. Restart chat to try again.'));
       }, TURN_TIMEOUT);
-      this.turn = { text: '', resolve, reject, timer };
+      this.turn = { text: '', resolve, reject, timer, id: null, toolCalls: 0 };
     });
     done.catch(() => {}); // A request failure may arrive before we await completion.
     try {
       const result = await this.request('turn/start', {
         threadId: this.threadId,
         input: [{ type: 'text', text: prefix + message }],
+        model: selectedModel,
         cwd: ROOT, approvalPolicy: 'never',
         sandboxPolicy: { type: 'readOnly' },
       }, 15000);
       if (!result?.turn?.id) throw new Error('Codex did not start the turn.');
+      if (this.turn) this.turn.id = result.turn.id;
       return await done;
     } catch (error) {
       if (this.turn) { clearTimeout(this.turn.timer); this.turn = null; }
@@ -247,6 +405,7 @@ class CodexSession {
     if (this.closed) return;
     this.closed = true;
     this.fail(new Error('Chat closed.'));
+    for (const child of ACTIVE_CARETAKER_CHILDREN) child.kill();
     // Closing the owned stdio channel asks app-server to exit. No force kill is
     // attempted because Node alone cannot verify Windows image and start time.
     if (this.child && !this.child.stdin.destroyed) this.child.stdin.end();
@@ -270,6 +429,20 @@ function main() {
         'Content-Security-Policy': "default-src 'none'; script-src 'nonce-caretaker'; style-src 'nonce-caretaker'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'" });
       res.end(page); return;
     }
+    if (req.method === 'GET' && req.url === '/models') {
+      if (req.headers['x-caretaker-csrf'] !== token) {
+        json(res, 403, { error: 'Request rejected.' }); return;
+      }
+      try {
+        await session.start();
+        json(res, 200, { models: session.models,
+          selectedModel: session.models.find(item => item.isDefault)?.id || session.models[0].id });
+      } catch (error) {
+        session.close();
+        json(res, 503, { error: error.message || 'Could not load Codex models.' });
+      }
+      return;
+    }
     if (req.method !== 'POST' || !['/chat', '/close'].includes(req.url)) {
       json(res, 404, { error: 'Not found.' }); return;
     }
@@ -288,8 +461,11 @@ function main() {
       if (typeof parsed.message !== 'string' || !parsed.message.trim() || parsed.message.length > MAX_MESSAGE) {
         throw new Error('Enter a message of at most 3,000 characters.');
       }
+      if (typeof parsed.model !== 'string' || parsed.model.length > 100) {
+        throw new Error('Choose a model from the list.');
+      }
       turns++;
-      json(res, 200, { reply: await session.ask(parsed.message.trim()), evidence: boundedEvidence() });
+      json(res, 200, { reply: await session.ask(parsed.message.trim(), parsed.model) });
     } catch (error) {
       json(res, 400, { error: error.message || 'Chat failed.' });
     } finally { busy = false; }
@@ -312,6 +488,10 @@ function main() {
         console.error('Could not verify Codex child exit; no force kill attempted.');
         process.exitCode = 1;
       }
+      if (ACTIVE_CARETAKER_CHILDREN.size) {
+        console.error('Could not verify Caretaker check exit.');
+        process.exitCode = 1;
+      }
       process.exit();
     }, 1200).unref();
   }
@@ -323,4 +503,5 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { boundedEvidence, validHost, validPost, isolatedCodexArgs, CodexSession };
+module.exports = { boundedEvidence, validHost, validPost, isolatedCodexArgs, compactInventory,
+  nameQuery, callCaretakerTool, CodexSession };

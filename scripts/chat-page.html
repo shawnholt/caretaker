@@ -9,20 +9,32 @@
   h1 { font-size: 1.35rem; margin: 0 }
   .sub { color: #9ca3af; margin: .25rem 0 1rem }
   #transcript { min-height: 45vh; max-height: 65vh; overflow: auto; border: 1px solid #374151; border-radius: .6rem; padding: 1rem }
-  .entry { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 1rem }
+  .entry { overflow-wrap: anywhere; margin: 0 0 1rem }
   .who { display: block; font-weight: 700; color: #93c5fd }
   .user .who { color: #a7f3d0 }
   form { margin-top: 1rem }
-  textarea { box-sizing: border-box; width: 100%; min-height: 6rem; padding: .7rem; border-radius: .5rem; border: 1px solid #6b7280; background: #1f2937; color: inherit; font: inherit }
+  .controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .75rem; align-items: end; margin-bottom: .75rem }
+  select, textarea { box-sizing: border-box; width: 100%; padding: .7rem; border-radius: .5rem; border: 1px solid #6b7280; background: #1f2937; color: inherit; font: inherit }
+  textarea { min-height: 6rem; resize: vertical }
+  select:disabled { opacity: .7 }
+  .md p { margin: .45rem 0 }
+  .md ul, .md ol { margin: .35rem 0; padding-left: 1.5rem }
+  .md pre { overflow-x: auto; padding: .7rem; border-radius: .4rem; background: #1f2937 }
+  .md code { padding: .08rem .25rem; border-radius: .2rem; background: #1f2937; font-family: ui-monospace, monospace }
+  .md pre code { padding: 0; background: transparent }
+  @media (max-width: 480px) { body { padding: 1rem } .controls { grid-template-columns: 1fr } }
   button { margin-top: .5rem; padding: .55rem 1rem; border: 0; border-radius: .4rem; background: #60a5fa; color: #111827; font-weight: 700; cursor: pointer }
   button:disabled { opacity: .55; cursor: wait }
   #status { color: #fbbf24; min-height: 1.5rem }
 </style>
 <body>
   <h1>Goliath Caretaker chat</h1>
-  <p class="sub">Questions use a saved, timestamped snapshot summary. It is historical and may be UNKNOWN.</p>
+  <p class="sub">Ask about Goliath's current state. Replies use live, read-only caretaker evidence; anything unavailable is reported as UNKNOWN.</p>
   <div id="transcript" role="log" aria-live="polite"></div>
-  <form id="form"><label for="message">Your question</label><textarea id="message" maxlength="3000" required placeholder="What does the saved snapshot show?"></textarea><button id="send">Send</button> <button type="button" id="stop">Stop chat</button></form>
+  <form id="form">
+    <div class="controls"><label for="model">Model<select id="model" disabled><option>Loading models…</option></select></label><button id="stop" type="button">Stop chat</button></div>
+    <label for="message">Your question</label><textarea id="message" maxlength="3000" required placeholder="What is Goliath doing right now?"></textarea><button id="send" disabled>Send</button>
+  </form>
   <p id="status" role="status"></p>
   <script nonce="caretaker">
     const csrf = '__CSRF_TOKEN__';
@@ -30,29 +42,103 @@
     const box = document.getElementById('message');
     const send = document.getElementById('send');
     const stop = document.getElementById('stop');
+    const model = document.getElementById('model');
     const transcript = document.getElementById('transcript');
     const status = document.getElementById('status');
     let closing = false;
-    function add(who, message, klass) {
-      const entry = document.createElement('p'); entry.className = 'entry ' + klass;
+    function appendInline(parent, text) {
+      const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+      let cursor = 0;
+      for (const match of text.matchAll(pattern)) {
+        parent.append(document.createTextNode(text.slice(cursor, match.index)));
+        const token = match[0];
+        const node = token.startsWith('`') ? document.createElement('code')
+          : document.createElement(token.startsWith('**') ? 'strong' : 'em');
+        node.textContent = token.startsWith('**') ? token.slice(2, -2) : token.slice(1, -1);
+        parent.append(node); cursor = match.index + token.length;
+      }
+      parent.append(document.createTextNode(text.slice(cursor)));
+    }
+    function renderMarkdown(parent, message) {
+      const lines = String(message).split(/\r?\n/);
+      let paragraph = [], list = null, code = null;
+      const flushParagraph = () => {
+        if (!paragraph.length) return;
+        const p = document.createElement('p');
+        paragraph.forEach((line, index) => { if (index) p.append(document.createElement('br')); appendInline(p, line); });
+        parent.append(p); paragraph = [];
+      };
+      const flushList = () => { if (list) { parent.append(list); list = null; } };
+      for (const line of lines) {
+        if (line.trim().startsWith('```')) {
+          flushParagraph(); flushList();
+          if (code) { parent.append(code.pre); code = null; }
+          else { const pre = document.createElement('pre'); const content = document.createElement('code'); pre.append(content); code = { pre, content }; }
+          continue;
+        }
+        if (code) { code.content.append(document.createTextNode(line + '\n')); continue; }
+        const item = line.match(/^\s*(?:[-*+]\s+|(\d+)\.\s+)(.*)$/);
+        if (item) {
+          flushParagraph();
+          const ordered = item[1] !== undefined;
+          if (!list || list.tagName !== (ordered ? 'OL' : 'UL')) { flushList(); list = document.createElement(ordered ? 'ol' : 'ul'); }
+          const li = document.createElement('li'); appendInline(li, item[2]); list.append(li);
+        } else if (!line.trim()) { flushParagraph(); flushList(); }
+        else {
+          flushList();
+          const heading = line.match(/^#{1,3}\s+(.+)$/);
+          if (heading) { flushParagraph(); const h = document.createElement('h' + line.match(/^#+/)[0].length); appendInline(h, heading[1]); parent.append(h); }
+          else paragraph.push(line);
+        }
+      }
+      if (code) parent.append(code.pre);
+      flushParagraph(); flushList();
+    }
+    function add(who, message, klass, markdown = false) {
+      const entry = document.createElement('div'); entry.className = 'entry ' + klass;
       const title = document.createElement('span'); title.className = 'who'; title.textContent = who;
-      entry.append(title, document.createTextNode(message)); transcript.append(entry);
+      entry.append(title);
+      if (markdown) { const body = document.createElement('div'); body.className = 'md'; renderMarkdown(body, message); entry.append(body); }
+      else entry.append(document.createTextNode(message));
+      transcript.append(entry);
       transcript.scrollTop = transcript.scrollHeight;
+    }
+    async function loadModels() {
+      try {
+        const response = await fetch('/models', { cache: 'no-store', headers: { 'x-caretaker-csrf': csrf } });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not load models.');
+        if (!Array.isArray(data.models) || !data.models.length) throw new Error('No chat models are available.');
+        model.replaceChildren();
+        for (const item of data.models) {
+          if (!item || typeof item.id !== 'string' || typeof item.displayName !== 'string') continue;
+          const option = document.createElement('option'); option.value = item.id; option.textContent = item.displayName;
+          option.selected = item.id === data.selectedModel || item.isDefault === true;
+          model.append(option);
+        }
+        if (!model.options.length) throw new Error('No chat models are available.');
+        if (data.selectedModel && [...model.options].some(option => option.value === data.selectedModel)) model.value = data.selectedModel;
+        else if (![...model.options].some(option => option.selected)) model.selectedIndex = 0;
+        model.disabled = false; send.disabled = false; status.textContent = '';
+      } catch (error) {
+        model.replaceChildren(); const option = document.createElement('option'); option.textContent = 'Models unavailable'; model.append(option);
+        status.textContent = error.message || 'Could not load chat models.';
+      }
     }
     form.addEventListener('submit', async event => {
       event.preventDefault();
-      const message = box.value.trim(); if (!message) return;
+      const message = box.value.trim(); if (!message || model.disabled || !model.value) return;
       add('You', message, 'user'); box.value = ''; send.disabled = true;
       status.textContent = 'Codex is thinking…';
       try {
         const response = await fetch('/chat', { method: 'POST', headers: {
           'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf },
-          body: JSON.stringify({ message }), cache: 'no-store' });
+          body: JSON.stringify({ message, model: model.value }), cache: 'no-store' });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Request failed.');
-        add('Codex', data.reply, 'assistant'); status.textContent = '';
+        add('Codex', data.reply, 'assistant', true); status.textContent = '';
       } catch (error) { status.textContent = error.message || 'Chat is unavailable.'; }
-      finally { send.disabled = false; box.focus(); }
+      finally { send.disabled = model.disabled || closing; box.focus(); }
     });
     window.addEventListener('pagehide', () => {
       if (closing) return; closing = true;
@@ -67,6 +153,7 @@
       send.disabled = true; box.disabled = true; stop.disabled = true;
       status.textContent = 'Chat stopped. Close this tab.';
     });
+    loadModels();
   </script>
 </body>
 </html>

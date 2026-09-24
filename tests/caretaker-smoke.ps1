@@ -43,6 +43,8 @@ $busyAfter = @(Add-ParentCreationTimes -Processes @($busyAfterParent, $busyAfter
 $busyResult = Get-BusyRows -Before $busyBefore -After $busyAfter -ElapsedSeconds 1 -Limit 1
 Assert-True ($busyResult.rows.Count -eq 1 -and $busyResult.rows[0].pid -eq 101 -and $busyResult.rows[0].cpuPercentOneCore -eq 150) 'busy ranks CPU deltas only for stable PID, creation, path, parent, and complete ancestry identities'
 Assert-True ($busyResult.rows[0].workingSetBytes -is [int64]) 'busy keeps working set byte counts numeric for JSON consumers'
+$namedIdle = Get-BusyRows -Before $busyBefore -After $busyAfter -ElapsedSeconds 1 -Limit 1 -FilterName 'parent'
+Assert-True ($namedIdle.named.Count -eq 1 -and $namedIdle.named[0].pid -eq 100 -and $namedIdle.named[0].cpuPercentOneCore -eq 0) 'busy finds a named process even with zero sampled CPU'
 $incompleteBusyParent = [pscustomobject]@{ pid = 100; parentPid = 0; creationTimeUtc = '2026-01-01T00:00:00Z'; name = 'parent.exe'; executablePath = ''; cpuTicks100ns = 1000 }
 $incompleteBusyAfter = @(Add-ParentCreationTimes -Processes @($incompleteBusyParent, $busyAfterChild))
 $incompleteBusyResult = Get-BusyRows -Before $busyBefore -After $incompleteBusyAfter -ElapsedSeconds 1 -Limit 1

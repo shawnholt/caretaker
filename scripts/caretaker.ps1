@@ -7,6 +7,8 @@ param(
   [int]$SampleSeconds = 1,
   [ValidateRange(1, 10)]
   [int]$Top = 5,
+  [ValidatePattern('^[A-Za-z0-9_. -]{1,80}$')]
+  [string]$ProcessName = '',
   [ValidateRange(1, 2147483647)]
   [int]$ProcessId,
   [ValidateRange(1, 30)]
@@ -310,9 +312,10 @@ function Get-ProcessIdentityKey {
 }
 
 function Get-BusyRows {
-  param([object[]]$Before, [object[]]$After, [double]$ElapsedSeconds, [int]$Limit)
+  param([object[]]$Before, [object[]]$After, [double]$ElapsedSeconds, [int]$Limit, [string]$FilterName = '')
   $beforeIndex = Get-ProcessIndex -Processes $Before
   $rows = New-Object System.Collections.Generic.List[object]
+  $named = New-Object System.Collections.Generic.List[object]
   $unknownIdentity = 0
   $unknownAncestry = 0
   foreach ($process in $After) {
@@ -325,17 +328,18 @@ function Get-BusyRows {
     if ($ancestry.state -ne 'KNOWN') { $unknownAncestry++ }
     $delta = [int64]$process.cpuTicks100ns - [int64]$prior.cpuTicks100ns
     if ($delta -lt 0) { $unknownIdentity++; continue }
-    if ($delta -eq 0) { continue }
     $percent = [Math]::Round(($delta / ($ElapsedSeconds * 10000000.0)) * 100.0, 1)
-    $rows.Add([pscustomobject]@{
+    $row = [pscustomobject]@{
       pid = $process.pid; creationTimeUtc = $process.creationTimeUtc; name = $process.name
       executablePath = $process.executablePath; parentPid = $process.parentPid
       attributionState = $ancestry.state; ancestry = $ancestry.text
       cpuPercentOneCore = $percent
       workingSetBytes = if ($process.PSObject.Properties.Name -contains 'workingSetBytes' -and $null -ne $process.workingSetBytes) { [int64]$process.workingSetBytes } else { $null }
-    })
+    }
+    if ($delta -gt 0) { $rows.Add($row) }
+    if ($FilterName -and $process.name.IndexOf($FilterName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $named.Add($row) }
   }
-  return [pscustomobject]@{ rows = @($rows | Sort-Object cpuPercentOneCore -Descending | Select-Object -First $Limit); unknownIdentityCount = $unknownIdentity; unknownAncestryCount = $unknownAncestry }
+  return [pscustomobject]@{ rows = @($rows | Sort-Object cpuPercentOneCore -Descending | Select-Object -First $Limit); named = @($named | Sort-Object workingSetBytes -Descending | Select-Object -First 10); unknownIdentityCount = $unknownIdentity; unknownAncestryCount = $unknownAncestry }
 }
 
 function Get-BusyMemorySummary {
@@ -385,11 +389,19 @@ function Invoke-Busy {
   if (-not $before.complete -or -not $after.complete) {
     return [pscustomobject]@{ schemaVersion = 1; action = 'busy'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; coverage = [pscustomobject]@{ processes = 'DEGRADED' }; reason = 'Process inventory exceeded the 2000 item cap.'; sampleSeconds = $SampleSeconds; processes = @() }
   }
+  $systemCpu = [pscustomobject]@{ state = 'UNKNOWN'; percent = $null; capturedAtUtc = (Get-UtcStamp); source = 'Win32_PerfFormattedData_PerfOS_Processor(_Total)' }
+  try {
+    $counter = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop | Select-Object -First 1
+    if ($null -eq $counter -or $null -eq $counter.PercentProcessorTime) { throw 'Aggregate CPU counter unavailable.' }
+    $cpuValue = [double]$counter.PercentProcessorTime
+    if ($cpuValue -lt 0 -or $cpuValue -gt 100) { throw 'Invalid aggregate CPU counter.' }
+    $systemCpu = [pscustomobject]@{ state = 'OK'; percent = [Math]::Round($cpuValue, 1); capturedAtUtc = (Get-UtcStamp); source = 'Win32_PerfFormattedData_PerfOS_Processor(_Total)' }
+  } catch { }
   $elapsed = [Math]::Max(0.001, $clock.Elapsed.TotalSeconds)
-  $busy = Get-BusyRows -Before $before.processes -After $after.processes -ElapsedSeconds $elapsed -Limit $Top
+  $busy = Get-BusyRows -Before $before.processes -After $after.processes -ElapsedSeconds $elapsed -Limit $Top -FilterName $ProcessName
   $memory = Get-BusyMemorySummary -Processes $after.processes -Limit $Top
   if ($busy.rows.Count -eq 0) {
-    return [pscustomobject]@{ schemaVersion = 1; action = 'busy'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; coverage = [pscustomobject]@{ cpu = 'UNKNOWN'; processIdentity = if ($busy.unknownIdentityCount -gt 0) { 'DEGRADED' } else { 'UNKNOWN' }; ancestry = 'UNKNOWN'; memoryCounters = $memory.coverage.counters; topMemoryConsumers = $memory.coverage.topConsumers }; reason = 'No processes had stable PID, creation time, and path identity across the sample.'; sampleSeconds = $elapsed; memory = $memory; incompleteIdentityCount = $busy.unknownIdentityCount; incompleteAncestryCount = $busy.unknownAncestryCount; processes = @() }
+    return [pscustomobject]@{ schemaVersion = 1; action = 'busy'; capturedAtUtc = $capturedAt; state = 'UNKNOWN'; coverage = [pscustomobject]@{ cpu = 'UNKNOWN'; aggregateCpu = $systemCpu.state; processIdentity = if ($busy.unknownIdentityCount -gt 0) { 'DEGRADED' } else { 'UNKNOWN' }; ancestry = 'UNKNOWN'; memoryCounters = $memory.coverage.counters; topMemoryConsumers = $memory.coverage.topConsumers }; reason = 'No processes had stable PID, creation time, path identity across the sample.'; sampleSeconds = $elapsed; systemCpu = $systemCpu; memory = $memory; requestedProcessName = $ProcessName; namedProcesses = @($busy.named); incompleteIdentityCount = $busy.unknownIdentityCount; incompleteAncestryCount = $busy.unknownAncestryCount; processes = @() }
   }
   $cpuCoverage = 'OK'
   $identityCoverage = if ($busy.unknownIdentityCount -gt 0) { 'DEGRADED' } else { 'OK' }
@@ -397,9 +409,9 @@ function Invoke-Busy {
   $state = if ($identityCoverage -ne 'OK' -or $ancestryCoverage -ne 'OK' -or $memory.state -ne 'OK') { 'DEGRADED' } else { 'OK' }
   return [pscustomobject]@{
     schemaVersion = 1; action = 'busy'; capturedAtUtc = $capturedAt; state = $state
-    coverage = [pscustomobject]@{ cpu = $cpuCoverage; processIdentity = $identityCoverage; ancestry = $ancestryCoverage; memoryCounters = $memory.coverage.counters; topMemoryConsumers = $memory.coverage.topConsumers }
+    coverage = [pscustomobject]@{ cpu = $cpuCoverage; aggregateCpu = $systemCpu.state; processIdentity = $identityCoverage; ancestry = $ancestryCoverage; memoryCounters = $memory.coverage.counters; topMemoryConsumers = $memory.coverage.topConsumers }
     sample = [pscustomobject]@{ requestedSeconds = $SampleSeconds; elapsedSeconds = [Math]::Round($elapsed, 2); cpuUnit = 'percent of one logical CPU' }
-    memory = $memory; incompleteIdentityCount = $busy.unknownIdentityCount; incompleteAncestryCount = $busy.unknownAncestryCount; processCount = $busy.rows.Count; processes = @($busy.rows)
+    systemCpu = $systemCpu; memory = $memory; requestedProcessName = $ProcessName; namedProcesses = @($busy.named); incompleteIdentityCount = $busy.unknownIdentityCount; incompleteAncestryCount = $busy.unknownAncestryCount; processCount = $busy.rows.Count; processes = @($busy.rows)
   }
 }
 

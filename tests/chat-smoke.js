@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { boundedEvidence, validHost, validPost } = require('../scripts/chat-server.js');
+const { boundedEvidence, validHost, validPost, nameQuery, callCaretakerTool } = require('../scripts/chat-server.js');
 
 test('chat evidence is bounded, historical, and omits raw private fields', () => {
   const fixture = path.join(__dirname, 'fixtures', 'chat-snapshot.json');
@@ -33,4 +33,12 @@ test('chat writes require the exact loopback origin and token', () => {
   assert.equal(validPost(request, 'wrong', port), false);
   assert.equal(validPost({ headers: { ...request.headers, origin: 'https://other.example' } }, 'secret', port), false);
   assert.equal(validPost({ headers: { ...request.headers, host: 'localhost:12345' } }, 'secret', port), false);
+});
+
+test('Caretaker tool arguments reject command text before starting a check', async () => {
+  assert.equal(nameQuery('WorldOfWarshipsLegends.exe'), 'WorldOfWarshipsLegends.exe');
+  assert.throws(() => nameQuery('foo; Stop-Process'), /short process name/);
+  await assert.rejects(callCaretakerTool('resources', { processName: 'foo; Stop-Process' }), /short process name/);
+  await assert.rejects(callCaretakerTool('process_details', { processId: '42' }), /valid process ID/);
+  await assert.rejects(callCaretakerTool('shell', {}), /not available/);
 });
