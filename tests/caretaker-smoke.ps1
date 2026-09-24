@@ -198,6 +198,14 @@ Assert-True ((Get-RetentionDoctorState -Retention $retentionMissing -Installed $
 $retentionCurrent = [pscustomobject]@{ state = 'OK'; marker = 'CURRENT' }
 Assert-True ((Get-RetentionDoctorState -Retention $retentionCurrent -Installed $true) -eq 'PASS') 'current retention marker passes after tick'
 Assert-True ((Get-LeaseStartDoctorState -CaptureLaunchEnabled $false -ExpiryTaskName '') -eq 'INFO') 'disabled on-demand capture is informational by policy'
+$collisionTask = Resolve-VerifiedTaskState -Identity ([pscustomobject]@{ state = 'COLLISION_OR_CHANGED' }) -Observed ([pscustomobject]@{ state = 'PRESENT_ENABLED'; detail = 'name-only task exists' })
+Assert-True ($collisionTask.state -eq 'COLLISION_OR_CHANGED') 'setup ownership collision overrides a name-only enabled task observation'
+Assert-True ((Get-TaskMatchState -Observed $collisionTask.state -Desired 'PRESENT_ENABLED') -eq 'MISMATCH') 'status reports a task ownership collision as deployment mismatch'
+Assert-True ((Get-TaskDoctorState -Observed $collisionTask.state -Desired 'PRESENT_ENABLED') -eq 'ERROR') 'doctor rejects a name-only task when setup identity is changed or unverified'
+$ownedDisabledTask = Resolve-VerifiedTaskState -Identity ([pscustomobject]@{ state = 'Disabled' }) -Observed ([pscustomobject]@{ state = 'PRESENT_DISABLED'; detail = 'disabled' })
+Assert-True ($ownedDisabledTask.state -eq 'PRESENT_DISABLED' -and (Get-TaskDoctorState -Observed $ownedDisabledTask.state -Desired 'PRESENT_DISABLED') -eq 'PASS') 'verified disabled task keeps its existing desired-state check'
+$absentTask = Resolve-VerifiedTaskState -Identity ([pscustomobject]@{ state = 'ABSENT' }) -Observed ([pscustomobject]@{ state = 'NOT_INSTALLED'; detail = 'absent' })
+Assert-True ($absentTask.state -eq 'NOT_INSTALLED' -and (Get-TaskDoctorState -Observed $absentTask.state -Desired 'NOT_INSTALLED') -eq 'PASS') 'verified task absence keeps its existing desired-state check'
 
 # review is the only writer of personal decisions into the canonical manifest.
 $realConfigPath = $script:ConfigPath

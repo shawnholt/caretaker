@@ -46,6 +46,7 @@ $script:LastAttemptPath = Join-Path $script:EvidencePath 'last-attempt.json'
 $script:LeasePath = Join-Path $script:EvidencePath 'active-lease.json'
 $script:LeaseCliPath = Join-Path $PSScriptRoot 'lease.ps1'
 $script:RetentionCliPath = Join-Path $PSScriptRoot 'retention.ps1'
+$script:SetupCliPath = Join-Path $PSScriptRoot 'setup.ps1'
 $script:RetentionStatePath = Join-Path $script:EvidencePath 'retention-state.json'
 $script:CommandLogBuffer = New-Object System.Collections.Generic.List[string]
 $script:Transcribing = $false
@@ -183,6 +184,70 @@ function Get-TaskState {
     }
     return [pscustomobject]@{ state = 'UNKNOWN'; detail = $_.Exception.Message }
   }
+}
+
+function Get-SetupTaskIdentity {
+  if (-not (Test-Path -LiteralPath $script:SetupCliPath -PathType Leaf)) {
+    return [pscustomobject]@{ state = 'UNKNOWN'; detail = 'Setup Plan script is missing.' }
+  }
+  $exe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $output = @(& $exe -NoProfile -NonInteractive -File $script:SetupCliPath -Action Plan 2>&1)
+  $exitCode = $LASTEXITCODE
+  $text = $output -join "`n"
+  if ($exitCode -ne 0 -or $text.Length -gt 65536) {
+    Add-CaretakerCommandLog -Label 'Setup Plan task identity' -Command 'setup.ps1 -Action Plan' -Reason 'Reuse the setup script read-only task ownership check.' -Output 'UNKNOWN: Plan failed or exceeded the output bound.'
+    return [pscustomobject]@{ state = 'UNKNOWN'; detail = 'Setup Plan failed or exceeded the 64 KiB output bound.' }
+  }
+  try { $plan = $text | ConvertFrom-Json -ErrorAction Stop }
+  catch {
+    Add-CaretakerCommandLog -Label 'Setup Plan task identity' -Command 'setup.ps1 -Action Plan' -Reason 'Reuse the setup script read-only task ownership check.' -Output 'UNKNOWN: Plan output is unreadable.'
+    return [pscustomobject]@{ state = 'UNKNOWN'; detail = 'Setup Plan output is unreadable.' }
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$plan.checkerState)) {
+    return [pscustomobject]@{ state = 'UNKNOWN'; detail = 'Setup Plan did not report checkerState.' }
+  }
+  $state = [string]$plan.checkerState
+  if ($state -notin @('ABSENT', 'COLLISION_OR_CHANGED', 'Unknown', 'Disabled', 'Queued', 'Ready', 'Running')) {
+    return [pscustomobject]@{ state = 'UNKNOWN'; detail = 'Setup Plan reported an unrecognized checkerState.' }
+  }
+  return [pscustomobject]@{ state = $state; detail = 'Identity state reported by read-only Setup Plan.' }
+}
+
+function Get-VerifiedTaskState {
+  param([Parameter(Mandatory = $true)][string]$TaskName)
+  $identity = Get-SetupTaskIdentity
+  if ($identity.state -in @('UNKNOWN', 'COLLISION_OR_CHANGED')) { return (Resolve-VerifiedTaskState -Identity $identity -Observed ([pscustomobject]@{ state = 'UNKNOWN' })) }
+  $observed = Get-TaskState -TaskName $TaskName
+  return (Resolve-VerifiedTaskState -Identity $identity -Observed $observed)
+}
+
+function Resolve-VerifiedTaskState {
+  param([Parameter(Mandatory = $true)]$Identity, [Parameter(Mandatory = $true)]$Observed)
+  if ($Identity.state -eq 'UNKNOWN') { return $Identity }
+  if ($Identity.state -eq 'COLLISION_OR_CHANGED') {
+    return [pscustomobject]@{ state = 'COLLISION_OR_CHANGED'; detail = 'Setup Plan found a task with the configured name but could not verify its exact receipt/action identity.' }
+  }
+  if ($Identity.state -eq 'ABSENT') {
+    if ($Observed.state -eq 'NOT_INSTALLED') { return $Observed }
+    return [pscustomobject]@{ state = 'UNKNOWN'; detail = 'Setup Plan and the named task query disagree about task presence.' }
+  }
+  if ($Observed.state -in @('PRESENT_ENABLED', 'PRESENT_DISABLED', 'UNKNOWN')) { return $Observed }
+  return [pscustomobject]@{ state = 'UNKNOWN'; detail = 'Setup Plan verified task identity, but the named task query did not find it.' }
+}
+
+function Get-TaskMatchState {
+  param([string]$Observed, [string]$Desired)
+  if ($Observed -eq 'UNKNOWN') { return 'UNKNOWN' }
+  if ($Observed -eq $Desired) { return 'MATCH' }
+  return 'MISMATCH'
+}
+
+function Get-TaskDoctorState {
+  param([string]$Observed, [string]$Desired)
+  if ($Observed -eq 'UNKNOWN') { return 'UNKNOWN' }
+  if ($Observed -eq 'COLLISION_OR_CHANGED') { return 'ERROR' }
+  if ($Observed -eq $Desired) { return 'PASS' }
+  return 'ERROR'
 }
 
 function Add-CaretakerCommandLog {
@@ -974,11 +1039,11 @@ function Invoke-Status {
   try { $snapshot = Read-JsonFile -Path $script:SnapshotPath } catch { Write-Output ("Snapshot: ERROR - unreadable runtime JSON: {0}" -f $_.Exception.Message); $snapshot = $null }
   try { $attempt = Read-JsonFile -Path $script:LastAttemptPath; $attemptHealth = Get-AttemptHealth $attempt } catch { $attemptHealth = [pscustomobject]@{ state = 'ERROR'; detail = "Unreadable attempt record: $($_.Exception.Message)" } }
   $freshness = Get-Freshness -Snapshot $snapshot -Config $config
-  $task = Get-TaskState -TaskName ([string]$config.deployment.taskName)
+  $task = Get-VerifiedTaskState -TaskName ([string]$config.deployment.taskName)
   $collector = Get-CollectorState -CollectorName ([string]$config.deployment.perfmon.collectorName)
   $taskEnabledDesired = [bool]$config.deployment.taskEnabled
   $taskDesired = if (-not [bool]$config.deployment.installed) { 'NOT_INSTALLED' } elseif ($taskEnabledDesired) { 'PRESENT_ENABLED' } else { 'PRESENT_DISABLED' }
-  $taskMatch = if ($task.state -eq 'UNKNOWN') { 'UNKNOWN' } elseif ($task.state -eq $taskDesired) { 'MATCH' } else { 'MISMATCH' }
+  $taskMatch = Get-TaskMatchState -Observed $task.state -Desired $taskDesired
   $collectorEnabledDesired = [bool]$config.deployment.collectorEnabled -or [bool]$config.deployment.perfmon.enabled
   $collectorMatch = if ($collector.state -eq 'UNKNOWN') { 'UNKNOWN' } elseif ($collectorEnabledDesired -and $collector.state -eq 'PRESENT_RUNNING') { 'MATCH' } elseif (-not $collectorEnabledDesired -and $collector.state -in @('NOT_INSTALLED','PRESENT_STOPPED')) { 'MATCH' } else { 'MISMATCH' }
   Write-Output 'Goliath Caretaker status'
@@ -1015,10 +1080,10 @@ function Invoke-Doctor {
   }
   $checks = @()
   $checks += [pscustomobject]@{ name = 'manifest'; state = 'PASS'; detail = 'Schema version 1 parsed; desired and deployment data are separate.' }
-  $task = Get-TaskState -TaskName ([string]$config.deployment.taskName)
+  $task = Get-VerifiedTaskState -TaskName ([string]$config.deployment.taskName)
   $taskEnabledDesired = [bool]$config.deployment.taskEnabled
   $taskDesired = if (-not [bool]$config.deployment.installed) { 'NOT_INSTALLED' } elseif ($taskEnabledDesired) { 'PRESENT_ENABLED' } else { 'PRESENT_DISABLED' }
-  $taskCheck = if ($task.state -eq 'UNKNOWN') { 'UNKNOWN' } elseif ($task.state -eq $taskDesired) { 'PASS' } else { 'ERROR' }
+  $taskCheck = Get-TaskDoctorState -Observed $task.state -Desired $taskDesired
   $checks += [pscustomobject]@{ name = 'scheduledTask'; state = $taskCheck; detail = "name=$($config.deployment.taskName); observed=$($task.state); desired=$taskDesired; $($task.detail)" }
   $collector = Get-CollectorState -CollectorName ([string]$config.deployment.perfmon.collectorName)
   $collectorEnabledDesired = [bool]$config.deployment.collectorEnabled -or [bool]$config.deployment.perfmon.enabled

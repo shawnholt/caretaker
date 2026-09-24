@@ -1,6 +1,6 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-  [ValidateSet('Plan', 'Install', 'Pause', 'Uninstall')]
+  [ValidateSet('Plan', 'Install', 'Pause', 'Uninstall', 'Rebind')]
   [string]$Action = 'Plan'
 )
 
@@ -118,6 +118,62 @@ function Test-OwnedTask($Task) {
   return ([string]$action.Execute -eq $want.Execute -and [string]$action.Arguments -eq $want.Arguments -and [string]$action.WorkingDirectory -eq $want.WorkingDirectory)
 }
 
+function Get-RebindAssessment($Task, $Receipt, [string[]]$Blockers) {
+  $reasons = [System.Collections.Generic.List[string]]::new()
+  $eligible = $false
+  if ($Task -and (Test-OwnedTask $Task)) {
+    return [pscustomobject]@{ eligible = $false; state = 'NOT_NEEDED'; receiptMatchesNativeTask = $true; oldCheckerTargetAbsent = $false; oldWorkingDirectoryAbsent = $false; currentCheckoutMismatch = $false; reasons = @() }
+  }
+  $oldChecker = $null
+  $receiptMatchesNativeTask = $false
+  $oldCheckerTargetAbsent = $false
+  $oldWorkingDirectoryAbsent = $false
+  $currentCheckoutMismatch = $false
+  if (-not $Task) { $reasons.Add('TASK_ABSENT') }
+  if (-not $Receipt) { $reasons.Add('RECEIPT_ABSENT') }
+  if ($Task -and $Receipt) {
+    $wantExe = (Get-ExpectedAction).Execute
+    $action = if ($Task.Actions.Count -eq 1) { $Task.Actions[0] } else { $null }
+    $nativeReceiptMatch = $action -and
+      [int]$Receipt.schemaVersion -eq 1 -and
+      [string]$Receipt.taskName -eq $script:TaskName -and
+      [string]$Receipt.taskDescription -ceq [string]$Task.Description -and
+      [string]$Receipt.execute -ieq [string]$action.Execute -and
+      [string]$Receipt.arguments -ceq [string]$action.Arguments -and
+      [string]$Receipt.workingDirectory -ieq [string]$action.WorkingDirectory
+    $receiptMatchesNativeTask = [bool]$nativeReceiptMatch
+    if (-not $nativeReceiptMatch) { $reasons.Add('RECEIPT_TASK_MISMATCH') }
+    if ([string]$Task.TaskName -ne $script:TaskName) { $reasons.Add('TASK_NAME_MISMATCH') }
+    if ([string]$Task.Description -cne $script:TaskDescription -or $Task.Actions.Count -ne 1) { $reasons.Add('TASK_IDENTITY_MISMATCH') }
+    if (-not $action -or [string]$action.Execute -ine $wantExe) { $reasons.Add('EXECUTABLE_MISMATCH') }
+    if ($action) {
+      $pattern = '^\-NoProfile \-NonInteractive \-File "([^"]+)" tick$'
+      $parsed = [regex]::Match([string]$action.Arguments, $pattern)
+      if (-not $parsed.Success) {
+        $reasons.Add('ACTION_SHAPE_MISMATCH')
+      } else {
+        try {
+          $oldChecker = [System.IO.Path]::GetFullPath($parsed.Groups[1].Value)
+          $oldRoot = [System.IO.Path]::GetFullPath([string]$action.WorkingDirectory)
+          $expectedOldChecker = [System.IO.Path]::GetFullPath((Join-Path $oldRoot 'scripts\caretaker.ps1'))
+          if (-not [string]::Equals($oldChecker, $expectedOldChecker, [System.StringComparison]::OrdinalIgnoreCase)) { $reasons.Add('ACTION_PATH_RELATION_MISMATCH') }
+          $oldCheckerTargetAbsent = -not (Test-Path -LiteralPath $oldChecker)
+          $oldWorkingDirectoryAbsent = -not (Test-Path -LiteralPath $oldRoot -PathType Container)
+          $currentCheckoutMismatch = -not [string]::Equals($oldChecker, [System.IO.Path]::GetFullPath($script:CheckerPath), [System.StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($oldRoot, [System.IO.Path]::GetFullPath($script:Root), [System.StringComparison]::OrdinalIgnoreCase)
+          if (-not $oldCheckerTargetAbsent) { $reasons.Add('OLD_CHECKER_STILL_EXISTS') }
+          if (-not $oldWorkingDirectoryAbsent) { $reasons.Add('OLD_WORKING_DIRECTORY_STILL_EXISTS') }
+        } catch { $reasons.Add('ACTION_PATH_INVALID') }
+      }
+    }
+  }
+  if (-not (Test-Path -LiteralPath $script:CheckerPath -PathType Leaf)) { $reasons.Add('CURRENT_CHECKER_MISSING') }
+  if ($Blockers.Count -gt 0) { $reasons.Add('CURRENT_READINESS_BLOCKED') }
+  $candidateReasons = @($reasons | Where-Object { $_ -notin @('CURRENT_READINESS_BLOCKED') })
+  if ($candidateReasons.Count -eq 0 -and $Blockers.Count -eq 0) { $eligible = $true }
+  $state = if ($eligible) { 'ELIGIBLE' } elseif ($reasons.Count -eq 0) { 'NOT_NEEDED' } else { 'BLOCKED' }
+  return [pscustomobject]@{ eligible = $eligible; state = $state; receiptMatchesNativeTask = $receiptMatchesNativeTask; oldCheckerTargetAbsent = $oldCheckerTargetAbsent; oldWorkingDirectoryAbsent = $oldWorkingDirectoryAbsent; currentCheckoutMismatch = $currentCheckoutMismatch; reasons = @($reasons) }
+}
+
 function Get-Blockers {
   $items = [System.Collections.Generic.List[string]]::new()
   $checkerText = Get-Content -LiteralPath $script:CheckerPath -Raw
@@ -135,6 +191,7 @@ function Show-Plan {
   $receipt = Get-Receipt
   [string[]]$blockers = @(Get-Blockers)
   $taskState = if (-not $task) { 'ABSENT' } elseif (Test-OwnedTask $task) { [string]$task.State } else { 'COLLISION_OR_CHANGED' }
+  $rebindAssessment = Get-RebindAssessment -Task $task -Receipt $receipt -Blockers $blockers
   if ($receipt -and -not (Test-ReceiptIdentity $receipt)) { $blockers += 'A setup receipt exists but does not match the exact task-only identity.' }
   if ($task -and -not (Test-OwnedTask $task)) { $blockers += 'The manifest-named task exists without an exact matching setup receipt/action.' }
   $perfmon = $script:Manifest.deployment.perfmon
@@ -146,6 +203,7 @@ function Show-Plan {
     configuredCollectorName = [string]$perfmon.collectorName; configuredOutput = (Join-Path $script:EvidencePath 'perfmon\caretaker.blg')
     sampleSeconds = $perfmon.sampleIntervalSeconds; maximumMiB = $perfmon.circularMaxMiB; counterResolution = $perfmon.counterResolution
     taskEnabled = [bool]$script:Manifest.deployment.taskEnabled; leaseLaunchEnabled = [bool]$script:Manifest.leasePolicy.captureLaunchEnabled
+    rebind = $rebindAssessment
     receiptPresent = [bool]$receipt; installState = if ($blockers.Count -eq 0) { 'PILOT_READY_FOR_REVIEW' } else { 'BLOCKED' }
     blockers = $blockers; systemChanges = 'None; Plan is read-only. Existing collectors are not queried or managed.'
   }
@@ -166,6 +224,99 @@ function New-TaskDefinition {
 function Write-Receipt {
   New-Item -ItemType Directory -Path $script:EvidencePath -Force | Out-Null
   Get-ExpectedReceipt | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:ReceiptPath -Encoding UTF8
+}
+
+function Write-ReceiptAtomic {
+  New-Item -ItemType Directory -Path $script:EvidencePath -Force | Out-Null
+  $tempPath = $script:ReceiptPath + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+  try {
+    [System.IO.File]::WriteAllText($tempPath, (Get-ExpectedReceipt | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    if ([System.IO.File]::Exists($script:ReceiptPath)) {
+      $backupPath = $script:ReceiptPath + '.' + [Guid]::NewGuid().ToString('N') + '.bak'
+      try { [System.IO.File]::Replace($tempPath, $script:ReceiptPath, $backupPath) }
+      finally { if ([System.IO.File]::Exists($backupPath)) { [System.IO.File]::Delete($backupPath) } }
+    }
+    else { [System.IO.File]::Move($tempPath, $script:ReceiptPath) }
+  } finally { if ([System.IO.File]::Exists($tempPath)) { [System.IO.File]::Delete($tempPath) } }
+}
+
+function Assert-NoRunningLease {
+  $statePath = Join-Path $script:EvidencePath 'active-lease.json'
+  if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { return }
+  $status = Invoke-LeaseAction -LeaseAction Status
+  if ($status.state -eq 'NONE' -or ([string]$status.state -match '^STOPPED(?:_|$)' -and [string]$status.lease.cleanupStatus -match '^STOPPED(?:_|$)')) { return }
+  throw "Lease state is $($status.state); Rebind requires no running or unknown lease. No task changes made."
+}
+
+function Rebind-OwnedTask {
+  $blockers = @(Get-Blockers)
+  if ($blockers.Count) { throw ('Rebind blocked by current readiness gates: ' + ($blockers -join ' ')) }
+  $task = Get-Task
+  $receipt = Get-Receipt
+  $assessment = Get-RebindAssessment -Task $task -Receipt $receipt -Blockers @()
+  if (-not $assessment.eligible) { throw ('Rebind refused: ' + (@($assessment.reasons) -join ', ')) }
+  Assert-NoRunningLease
+  $task = Get-Task
+  $receipt = Get-Receipt
+  $assessment = Get-RebindAssessment -Task $task -Receipt $receipt -Blockers @()
+  if (-not $assessment.eligible) { throw ('Rebind refused after fresh identity check: ' + (@($assessment.reasons) -join ', ')) }
+  if ([string]$task.State -eq 'Running') { throw 'The caretaker task is currently running; Rebind refused without changes.' }
+  if (-not $script:ActionCmdlet.ShouldProcess($script:TaskName, 'Rebind the exact receipt-matched caretaker task to the current checkout')) { return }
+
+  $oldReceiptText = Get-Content -LiteralPath $script:ReceiptPath -Raw
+  $oldReceipt = $oldReceiptText | ConvertFrom-Json -ErrorAction Stop
+  $oldAction = $task.Actions[0]
+  $want = Get-ExpectedAction
+  New-Item -ItemType Directory -Path $script:EvidencePath -Force | Out-Null
+  $rollbackPath = Join-Path $script:EvidencePath ('setup-rebind-rollback-' + [Guid]::NewGuid().ToString('N') + '.json')
+  $rollbackRecord = [pscustomobject]@{
+    schemaVersion = 1; taskName = $script:TaskName; taskDescription = [string]$task.Description
+    priorAction = [pscustomobject]@{ execute = [string]$oldAction.Execute; arguments = [string]$oldAction.Arguments; workingDirectory = [string]$oldAction.WorkingDirectory }
+    priorReceipt = $oldReceipt; enabled = [bool]$task.Settings.Enabled
+    triggerCount = $task.Triggers.Count; recordedAtUtc = [DateTime]::UtcNow.ToString('o')
+  }
+  [System.IO.File]::WriteAllText($rollbackPath, ($rollbackRecord | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+  Write-ChangeLog -Command "Set-ScheduledTask action for $script:TaskName" -Outcome ('Rebind requested for the exact receipt-matched caretaker task; prior action and receipt preserved in evidence rollback record ' + (Split-Path -Leaf $rollbackPath) + '.') -Rollback ('Restore the prior task action and receipt from ' + (Split-Path -Leaf $rollbackPath) + '; verify native task and receipt before resuming operation.')
+  try {
+    Invoke-LoggedCmdlet -Command "Set-ScheduledTask -TaskName $script:TaskName -Action <current caretaker action>" -Reason 'Rebind only the exact receipt-matched caretaker task to the current checkout.' -ScriptBlock {
+      $newAction = New-ScheduledTaskAction -Execute $want.Execute -Argument $want.Arguments -WorkingDirectory $want.WorkingDirectory
+      Set-ScheduledTask -TaskName $script:TaskName -Action $newAction -ErrorAction Stop | Out-Null
+    } | Out-Null
+    $afterAction = Get-Task
+    if (-not $afterAction -or $afterAction.Description -cne $script:TaskDescription -or $afterAction.Actions.Count -ne 1 -or
+        [string]$afterAction.Actions[0].Execute -ine $want.Execute -or [string]$afterAction.Actions[0].Arguments -cne $want.Arguments -or
+        [string]$afterAction.Actions[0].WorkingDirectory -ine $want.WorkingDirectory -or
+        [bool]$afterAction.Settings.Enabled -ne [bool]$task.Settings.Enabled -or $afterAction.Triggers.Count -ne $task.Triggers.Count) {
+      throw 'Native task post-rebind verification failed.'
+    }
+    Write-ReceiptAtomic
+    $verified = Get-Task
+    if (-not (Test-OwnedTask $verified)) { throw 'Receipt/task post-rebind verification failed.' }
+    Write-ChangeLog -Command "Verify rebound caretaker task $script:TaskName" -Outcome 'Verified current task action and refreshed receipt; enabled state and trigger were preserved.' -Rollback 'Restore prior task action and receipt from the preceding rollback record.'
+    Write-Output 'Exact caretaker task rebound to the current checkout and verified; enabled state and trigger were preserved.'
+  } catch {
+    $rebindError = $_.Exception.Message
+    $rollbackOk = $false
+    try {
+      $currentTask = Get-Task
+      if (-not $currentTask -or $currentTask.Description -cne $script:TaskDescription -or $currentTask.Actions.Count -ne 1 -or
+          [string]$currentTask.Actions[0].Execute -ine $want.Execute -or [string]$currentTask.Actions[0].Arguments -cne $want.Arguments -or
+          [string]$currentTask.Actions[0].WorkingDirectory -ine $want.WorkingDirectory) {
+        throw 'Task no longer has the exact new action; rollback will not overwrite concurrent changes.'
+      }
+      $currentReceipt = Get-Receipt
+      $currentReceiptIsOld = [string]$currentReceipt.taskName -ceq [string]$oldReceipt.taskName -and [string]$currentReceipt.taskDescription -ceq [string]$oldReceipt.taskDescription -and [string]$currentReceipt.execute -ieq [string]$oldReceipt.execute -and [string]$currentReceipt.arguments -ceq [string]$oldReceipt.arguments -and [string]$currentReceipt.workingDirectory -ieq [string]$oldReceipt.workingDirectory
+      if (-not (Test-ReceiptIdentity $currentReceipt) -and -not $currentReceiptIsOld) { throw 'Receipt no longer matches old or new expected identity; rollback will not overwrite concurrent changes.' }
+      $restoreAction = New-ScheduledTaskAction -Execute ([string]$oldAction.Execute) -Argument ([string]$oldAction.Arguments) -WorkingDirectory ([string]$oldAction.WorkingDirectory)
+      Set-ScheduledTask -TaskName $script:TaskName -Action $restoreAction -ErrorAction Stop | Out-Null
+      if (-not $currentReceiptIsOld) { [System.IO.File]::WriteAllText($script:ReceiptPath, $oldReceiptText, (New-Object System.Text.UTF8Encoding($false))) }
+      $restored = Get-Task
+      $restoredReceipt = Get-Receipt
+      $rollbackOk = [string]$restored.Actions[0].Execute -ieq [string]$oldAction.Execute -and [string]$restored.Actions[0].Arguments -ceq [string]$oldAction.Arguments -and [string]$restored.Actions[0].WorkingDirectory -ieq [string]$oldAction.WorkingDirectory -and [bool]$restored.Settings.Enabled -eq [bool]$rollbackRecord.enabled -and $restored.Triggers.Count -eq [int]$rollbackRecord.triggerCount -and [string]$restoredReceipt.taskName -ceq [string]$oldReceipt.taskName -and [string]$restoredReceipt.taskDescription -ceq [string]$oldReceipt.taskDescription -and [string]$restoredReceipt.execute -ieq [string]$oldReceipt.execute -and [string]$restoredReceipt.arguments -ceq [string]$oldReceipt.arguments -and [string]$restoredReceipt.workingDirectory -ieq [string]$oldReceipt.workingDirectory
+    } catch { $rollbackOk = $false }
+    if (-not $rollbackOk) { throw "Rebind failed and rollback could not be verified. Preserve state and inspect the exact task and receipt. Original error: $rebindError" }
+    throw "Rebind failed; prior task action and receipt rollback were verified. Original error: $rebindError"
+  }
 }
 
 function Install-OwnedTask {
@@ -281,16 +432,19 @@ function Uninstall-OwnedTask {
   Write-ChangeLog -Command "Unregister-ScheduledTask $script:TaskName" -Outcome 'Removed verified owned checker task; preserved evidence and all PerfMon collectors.' -Rollback 'Reinstall only after reviewing the manifest and confirming the exact task name is unused; no collector action is included.'
 }
 
-$invocation = 'powershell -NoProfile -File .\scripts\setup.ps1 -Action ' + $Action
-Write-RunLog -Label 'Setup invocation' -Command $invocation -Reason "Requested setup action: $Action" -Output 'Started.'
-try {
-  switch ($Action) {
-    'Plan' { Show-Plan }
-    'Install' { Install-OwnedTask }
-    'Pause' { Pause-OwnedTask }
-    'Uninstall' { Uninstall-OwnedTask }
+if ($MyInvocation.InvocationName -ne '.') {
+  $invocation = 'powershell -NoProfile -File .\scripts\setup.ps1 -Action ' + $Action
+  Write-RunLog -Label 'Setup invocation' -Command $invocation -Reason "Requested setup action: $Action" -Output 'Started.'
+  try {
+    switch ($Action) {
+      'Plan' { Show-Plan }
+      'Install' { Install-OwnedTask }
+      'Pause' { Pause-OwnedTask }
+      'Uninstall' { Uninstall-OwnedTask }
+      'Rebind' { Rebind-OwnedTask }
+    }
+  } catch {
+    Write-RunLog -Label 'Setup action failed' -Command $invocation -Reason "Requested setup action: $Action" -Output $_.ToString()
+    throw
   }
-} catch {
-  Write-RunLog -Label 'Setup action failed' -Command $invocation -Reason "Requested setup action: $Action" -Output $_.ToString()
-  throw
 }

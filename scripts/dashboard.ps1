@@ -57,19 +57,20 @@ function Get-ObservedRows([object]$Source, [string]$Name) {
   return @($property.Value)
 }
 
-function Get-DisplayTimeZone {
-  foreach ($id in @('Eastern Standard Time', 'America/New_York')) {
-    try { return [TimeZoneInfo]::FindSystemTimeZoneById($id) } catch {}
+function Get-DisplayZoneLabel([DateTimeOffset]$Value, [TimeZoneInfo]$Zone) {
+  if ($Zone.Id -in @('Eastern Standard Time', 'America/New_York')) {
+    if ($Zone.IsDaylightSavingTime($Value)) { return 'EDT' }
+    return 'EST'
   }
-  return [TimeZoneInfo]::Local
+  return $Value.ToString('zzz')
 }
 
 function Format-HelpButton([string]$Label, [string]$Text) {
-  $safe = Html $Text
-  return ('<button type="button" class="help" aria-label="{0}" title="{1}">?</button>' -f (Html $Label), $safe)
+  $id = 'help-' + [Guid]::NewGuid().ToString('N')
+  return ('<span class="help-wrap"><button type="button" class="help" aria-label="Help: {0}" aria-controls="{1}" aria-describedby="{1}" aria-expanded="false">?</button><span class="help-tip" id="{1}" role="tooltip" hidden>{2}</span></span>' -f (Html $Label), $id, (Html $Text))
 }
 
-$displayZone = Get-DisplayTimeZone
+$displayZone = [TimeZoneInfo]::Local
 $capturedLabel = 'UNKNOWN'
 $capturedLocalLabel = 'UNKNOWN'
 $freshness = 'UNKNOWN'
@@ -86,14 +87,14 @@ if ($capturedValue) {
       $freshnessDetail = 'Snapshot time is in the future.'
     } elseif ($ageMinutes -le $freshnessLimitMinutes) {
       $freshness = 'FRESH'
-      $freshnessDetail = ("{0} min old; within the {1}-minute checker window." -f $ageMinutes, $freshnessLimitMinutes)
+      $freshnessDetail = ("{0} min old; within checker window." -f $ageMinutes)
     } else {
       $freshness = 'STALE'
-      $freshnessDetail = ("{0} min old; older than the {1}-minute checker window." -f $ageMinutes, $freshnessLimitMinutes)
+      $freshnessDetail = ("{0} min old; outside checker window." -f $ageMinutes)
     }
     $capturedLabel = $capturedAt.ToString('yyyy-MM-dd HH:mm:ss UTC')
     $local = [TimeZoneInfo]::ConvertTime($capturedAt, $displayZone)
-    $capturedLocalLabel = $local.ToString('MMM d, yyyy h:mm tt') + ' ' + $local.ToString('zzz')
+    $capturedLocalLabel = $local.ToString('MMM d, yyyy h:mm tt') + ' ' + (Get-DisplayZoneLabel $local $displayZone)
   } catch {
     $freshness = 'UNKNOWN'
     $freshnessDetail = 'Snapshot time is invalid.'
@@ -117,7 +118,7 @@ try {
   $attentionDetail = 'Alert state could not be read.'
 }
 
-$recentChangeHtml = '<p class="muted empty">UNKNOWN — no change journal is available.</p>'
+$recentChangeHtml = '<p class="muted empty">UNKNOWN - no change journal is available.</p>'
 try {
   $changesPath = Join-Path $EvidenceRoot 'changes.jsonl'
   if (Test-Path -LiteralPath $changesPath -PathType Leaf) {
@@ -142,6 +143,14 @@ try {
 }
 
 $coverageNames = @('processes', 'tcpListeners', 'udpEndpoints', 'services', 'tasks', 'startup')
+$moduleDescriptions = @{
+  processes = 'Process identities and working-set memory sampled at capture time.'
+  tcpListeners = 'Saved TCP listening endpoints and their attributed process, when available.'
+  udpEndpoints = 'Saved UDP endpoints and their attributed process, when available.'
+  services = 'Windows service name, display name, state, and start mode.'
+  tasks = 'Scheduled task name, state, enabled state, and action/trigger counts; command details are omitted.'
+  startup = 'Startup entry name and location; command details are omitted.'
+}
 $coverageOkCount = 0
 $coverageKnownCount = 0
 $coverageHtml = foreach ($name in $coverageNames) {
@@ -159,11 +168,14 @@ $coverageHtml = foreach ($name in $coverageNames) {
     }
     if ($null -ne $entryCount -and [string]$entryCount -match '^\d+$') { $countLabel = [string]$entryCount }
   }
-  '<tr><th>{0}</th><td><span class="state state-{1}">{2}</span></td><td class="count">{3}</td></tr>' -f (Html $name), (Html $state.ToLowerInvariant()), (Html $state), (Html $countLabel)
+  $target = if ($name -eq 'processes') { '#processes' } elseif ($name -eq 'tcpListeners') { '#listeners' } else { '#records-' + $name }
+  $help = Format-HelpButton $name ($moduleDescriptions[$name] + ' OK means collected successfully; DEGRADED means partial coverage; UNKNOWN means evidence is unavailable or insufficient.')
+  '<tr><th><a href="{0}">{1}</a>{2}</th><td><span class="state state-{3}">{4}</span></td><td class="count">{5}</td></tr>' -f $target, (Html $name), $help, (Html $state.ToLowerInvariant()), (Html $state), (Html $countLabel)
 }
 
 $processRows = @()
 $listenerRows = @()
+$observed = $null
 $tcpCount = 'UNKNOWN'
 if ($snapshot) {
   $observed = Read-Coverage $snapshot 'observed'
@@ -176,7 +188,7 @@ if ($snapshot) {
 }
 
 $processHtml = if ($processRows.Count -eq 0) {
-  '<tr><td colspan="3" class="muted">UNKNOWN — no process memory rows are available.</td></tr>'
+  '<tr><td colspan="3" class="muted">UNKNOWN - no process memory rows are available.</td></tr>'
 } else {
   foreach ($process in $processRows) {
     $processName = Read-Coverage $process 'name'
@@ -213,7 +225,7 @@ if ($snapshot) {
 }
 
 $listenerHtml = if ($listenerRows.Count -eq 0) {
-  '<tr><td colspan="4" class="muted">No TCP listeners in the saved snapshot, or coverage is unavailable.</td></tr>'
+  '<tr><td colspan="4" class="muted">No TCP listener rows are available in this snapshot.</td></tr>'
 } else {
   foreach ($listener in ($listenerRows | Sort-Object { [string](Read-Coverage $_ 'protocol') }, { [int](Read-Coverage $_ 'localPort') } | Select-Object -First 12)) {
     $endpoint = '{0}:{1}' -f [string](Read-Coverage $listener 'localAddress'), [string](Read-Coverage $listener 'localPort')
@@ -224,8 +236,10 @@ $listenerHtml = if ($listenerRows.Count -eq 0) {
     $key = ('TCP|{0}|{1}' -f ([string](Read-Coverage $listener 'localAddress')).ToLowerInvariant(), [int](Read-Coverage $listener 'localPort'))
     $alertId = 'unreviewed-listener:' + $key
     $review = 'UNKNOWN'
-    if ($tcpCoverageStatus -ne 'OK') {
+    if ($tcpCoverageStatus -eq 'DEGRADED') {
       $review = 'UNKNOWN (partial TCP coverage)'
+    } elseif ($tcpCoverageStatus -ne 'OK') {
+      $review = 'UNKNOWN (TCP coverage unavailable)'
     } elseif (Test-ListenerApprovedRow $listener $desiredListeners) {
       $review = 'Expected (manifest-approved)'
     } elseif ($alertKeys.ContainsKey($alertId)) {
@@ -236,6 +250,24 @@ $listenerHtml = if ($listenerRows.Count -eq 0) {
     '<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td></tr>' -f (Html ([string](Read-Coverage $listener 'protocol'))), (Html $endpoint), (Html $owner), (Html $review)
   }
 }
+
+function Build-RecordPanel([string]$Id, [string]$Title, [string]$Description, [object[]]$Rows, [string[]]$Headers, [scriptblock]$Cells, [int]$Limit = 20) {
+  if ($Rows.Count -eq 0) { $body = '<p class="muted empty">UNKNOWN - no saved records are available.</p>' }
+  else {
+    $head = '<tr>' + (($Headers | ForEach-Object { '<th>{0}</th>' -f (Html $_) }) -join '') + '</tr>'
+    $displayRows = foreach ($row in ($Rows | Select-Object -First $Limit)) { '<tr>' + (& $Cells $row) + '</tr>' }
+    $body = '<div class="table-wrap"><table><thead>' + $head + '</thead><tbody>' + ($displayRows -join '') + '</tbody></table></div>'
+    if ($Rows.Count -gt $Limit) { $Description += (' Showing the first {0} of {1} saved rows.' -f $Limit, $Rows.Count) }
+  }
+  '<section class="panel" id="records-{0}"><div class="panel-head"><h3>{1}</h3><span class="panel-kicker">{2} saved rows</span></div><p class="panel-copy">{3}</p>{4}</section>' -f $Id, (Html $Title), $Rows.Count, (Html $Description), $body
+}
+
+$moduleRecordsHtml = @(
+  (Build-RecordPanel 'udpEndpoints' 'UDP endpoints' 'Saved local endpoint and process name; attribution may be unavailable.' @(Get-ObservedRows $observed 'udpEndpoints') @('Endpoint', 'Process') { param($r) '<td>{0}:{1}</td><td>{2}</td>' -f (Html ([string](Read-Coverage $r 'localAddress'))), (Html ([string](Read-Coverage $r 'localPort'))), (Html ([string](Read-Coverage (Read-Coverage $r 'process') 'name'))) })
+  (Build-RecordPanel 'services' 'Services' 'Service display name, state, and start mode.' @(Get-ObservedRows $observed 'services') @('Service', 'State', 'Start mode') { param($r) '<td>{0}</td><td>{1}</td><td>{2}</td>' -f (Html ([string](Read-Coverage $r 'displayName'))), (Html ([string](Read-Coverage $r 'state'))), (Html ([string](Read-Coverage $r 'startMode'))) })
+  (Build-RecordPanel 'tasks' 'Scheduled tasks' 'Task name, state, and enabled state; action details are omitted.' @(Get-ObservedRows $observed 'tasks') @('Task', 'State', 'Enabled') { param($r) '<td>{0}</td><td>{1}</td><td>{2}</td>' -f (Html ([string](Read-Coverage $r 'name'))), (Html ([string](Read-Coverage $r 'state'))), (Html ([string](Read-Coverage $r 'enabled'))) })
+  (Build-RecordPanel 'startup' 'Startup entries' 'Entry name and location; command details are omitted.' @(Get-ObservedRows $observed 'startup') @('Entry', 'Location') { param($r) '<td>{0}</td><td>{1}</td>' -f (Html ([string](Read-Coverage $r 'name'))), (Html ([string](Read-Coverage $r 'location'))) })
+)
 
 $problemHtml = if ($snapshotProblem) { '<p class="notice">{0}</p>' -f (Html $snapshotProblem) } else { '' }
 $freshnessClass = if ($freshness -eq 'FRESH') { 'fresh' } elseif ($freshness -eq 'STALE') { 'stale' } else { 'unknown' }
@@ -248,17 +280,19 @@ $attentionDetailSafe = Html $attentionDetail
 $tcpCountSafe = Html $tcpCount
 $coverageSummary = '{0} of {1} modules collected OK' -f $coverageOkCount, $coverageNames.Count
 $coverageSummarySafe = Html $coverageSummary
-$helpFreshness = Format-HelpButton 'Freshness' 'FRESH means the saved snapshot is within three checker intervals (same rule as caretaker status). This HTML is static; freshness was calculated when the page was generated.'
-$helpCoverage = Format-HelpButton 'Coverage' 'Counts inventory modules whose collection reported OK for this snapshot. OK means the module was collected successfully, not that Goliath is healthy.'
-$helpAttention = Format-HelpButton 'Needs attention' 'Open review items from saved alert state (for example unreviewed TCP listeners after a complete prior baseline). Personal review/snooze decisions live in the manifest and never hide this count; snooze only suppresses re-nag. Repeated observation does not approve a listener.'
+$helpFreshness = Format-HelpButton 'Freshness' ("FRESH means the saved snapshot is no older than {0} minutes (three checker intervals, with a 15-minute minimum). This static page calculates freshness when generated." -f $freshnessLimitMinutes)
+$helpCoverage = Format-HelpButton 'Coverage' 'Counts inventory modules whose collection reported OK for this snapshot. OK means collection succeeded; it does not mean a health check passed or that Goliath is healthy. Select a module name to view saved records.'
+$helpAttention = Format-HelpButton 'Needs attention' 'Open review items from saved alert state. This count is not a machine health score. Personal review/snooze decisions live in the manifest; snooze only suppresses re-nag.'
 $helpCaptured = Format-HelpButton 'Captured time' 'Local time for readability; UTC is kept in saved evidence and shown below.'
+$helpMemory = Format-HelpButton 'Working set memory' 'Memory held by each process at the snapshot capture time. The table shows the top 10 rows; this is not an average, peak, or cumulative measure over an interval.'
+$helpListeners = Format-HelpButton 'TCP listener review' 'Expected requires complete coverage and an exact manifest match for protocol, address, port, and executable path. Needs review requires an open saved alert after complete coverage. Other rows are observations without a health or reachability verdict.'
 $html = @"
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Goliath Caretaker — Snapshot dashboard</title>
+  <title>Goliath Caretaker - Snapshot dashboard</title>
   <style>
     :root { color-scheme: dark; font-family: "Segoe UI", sans-serif; background:#0b1220; color:#e6edf7; }
     * { box-sizing:border-box; }
@@ -283,8 +317,12 @@ $html = @"
     .metric-value { display:block; margin:11px 0 4px; font-size:21px; font-weight:650; overflow-wrap:anywhere; }
     .metric-detail { color:#91a2b8; font-size:11px; line-height:1.4; } .fresh { color:#68d6a0; } .stale { color:#f3c46b; } .unknown { color:#f0bd61; }
     .metric-label { display:inline-flex; align-items:center; gap:6px; }
-    button.help { width:18px; height:18px; padding:0; border:1px solid #3a4f68; border-radius:999px; background:#152235; color:#9ec9ff; font-size:11px; font-weight:700; line-height:1; cursor:help; }
+    .help-wrap { position:relative; display:inline-flex; vertical-align:middle; }
+    button.help { width:18px; height:18px; padding:0; border:1px solid #3a4f68; border-radius:999px; background:#152235; color:#9ec9ff; font-size:11px; font-weight:700; line-height:1; cursor:pointer; }
     button.help:focus { outline:2px solid #31b8ff; outline-offset:2px; }
+    .help-tip { position:absolute; z-index:5; left:22px; top:0; width:min(300px,70vw); padding:9px 11px; border:1px solid #3a4f68; border-radius:8px; color:#dce8f6; background:#101b2b; box-shadow:0 8px 24px #0008; font-size:11px; font-weight:400; letter-spacing:normal; line-height:1.5; text-transform:none; }
+    th a { color:inherit; text-decoration:underline; text-decoration-color:#536983; text-underline-offset:3px; }
+    h3 { margin:0; font-size:13px; font-weight:650; }
     .content-grid { display:grid; grid-template-columns:minmax(0,1.08fr) minmax(0,.92fr); gap:15px; align-items:start; }
     .stack { display:grid; gap:15px; min-width:0; } .panel { padding:17px; min-width:0; }
     .panel-head { display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:5px; }
@@ -306,7 +344,7 @@ $html = @"
 <body>
   <div class="shell">
     <aside>
-      <div class="brand"><span class="brand-mark" aria-hidden="true">◆</span><div><strong>Goliath Caretaker</strong><small>Local workstation view</small></div></div>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">&#9670;</span><div><strong>Goliath Caretaker</strong><small>Local workstation view</small></div></div>
       <nav aria-label="Dashboard sections"><a href="#overview">Overview</a><a href="#attention">Needs attention</a><a href="#coverage">Coverage</a><a href="#processes">Processes</a><a href="#listeners">Listeners</a><a href="#changes">Recent changes</a></nav>
       <div class="side-note"><b>Ask Caretaker</b><span>Run <code>node scripts\chat-server.js</code> for on-demand chat with live read-only checks. Stop chat or close the tab when finished.</span></div>
       <div class="side-note"><b>Evidence mode</b><span>Saved snapshot only<br>Generated on demand<br>No live polling on this page</span></div>
@@ -318,30 +356,54 @@ $html = @"
         <article class="metric"><span class="metric-label">Captured (local)$helpCaptured</span><strong class="metric-value">$capturedSafe</strong><span class="metric-detail">UTC evidence: $capturedUtcSafe</span></article>
         <article class="metric"><span class="metric-label">Freshness when generated$helpFreshness</span><strong class="metric-value $freshnessClass">$freshnessSafe</strong><span class="metric-detail">$freshnessDetailSafe</span></article>
         <article class="metric" id="attention"><span class="metric-label">Needs attention$helpAttention</span><strong class="metric-value">$attentionSafe</strong><span class="metric-detail">$attentionDetailSafe</span></article>
-        <article class="metric"><span class="metric-label">Inventory modules OK$helpCoverage</span><strong class="metric-value">$coverageOkCount / $($coverageNames.Count)</strong><span class="metric-detail">$coverageSummarySafe</span></article>
+        <article class="metric"><span class="metric-label">Inventory modules collected OK$helpCoverage</span><strong class="metric-value">$coverageOkCount of $($coverageNames.Count)</strong><span class="metric-detail">$coverageSummarySafe</span></article>
       </section>
       <div class="content-grid">
         <div class="stack">
-          <section class="panel" id="coverage"><div class="panel-head"><h2>Inventory coverage</h2><span class="panel-kicker">Snapshot modules</span></div><p class="panel-copy">Each state describes collection coverage for this snapshot; OK does not certify overall machine health.</p><div class="table-wrap"><table><thead><tr><th>Module</th><th>State</th><th>Rows</th></tr></thead><tbody>
+          <section class="panel" id="coverage"><div class="panel-head"><h2>Inventory coverage</h2><span class="panel-kicker">Snapshot modules</span></div><p class="panel-copy">Select a module to open its saved records. OK means collected; DEGRADED means partial collection; UNKNOWN means evidence was unavailable or insufficient. None is a health verdict.</p><div class="table-wrap"><table><thead><tr><th>Module</th><th>Collection</th><th>Rows</th></tr></thead><tbody>
             $($coverageHtml -join "`n            ")
           </tbody></table></div></section>
-          <section class="panel" id="processes"><div class="panel-head"><h2>Memory at capture (working set)</h2><span class="panel-kicker">Top 10 saved rows</span></div><p class="panel-copy">Single-point memory sample from the saved snapshot, not cumulative CPU or interval totals. Paths and command lines are omitted.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>PID</th><th>Working set</th></tr></thead><tbody>
+          <section class="panel" id="processes"><div class="panel-head"><h2>Memory at capture (working set)$helpMemory</h2><span class="panel-kicker">Top 10 saved rows</span></div><p class="panel-copy">Single-point memory sample from the saved snapshot, not cumulative CPU or interval totals. Paths and command lines are omitted.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>PID</th><th>Working set</th></tr></thead><tbody>
             $($processHtml -join "`n            ")
           </tbody></table></div></section>
         </div>
         <div class="stack">
-          <section class="panel" id="listeners"><div class="panel-head"><h2>TCP listeners</h2><span class="panel-kicker">$tcpCountSafe saved rows</span></div><p class="panel-copy">Review uses manifest-approved listener identity plus saved alert state. A bind address alone does not prove external reachability.</p><div class="table-wrap"><table><thead><tr><th>Protocol</th><th>Local endpoint</th><th>Process</th><th>Review</th></tr></thead><tbody>
+          <section class="panel" id="listeners"><div class="panel-head"><h2>TCP listeners$helpListeners</h2><span class="panel-kicker">$tcpCountSafe saved rows (showing up to 12)</span></div><p class="panel-copy">Rule: Expected requires complete TCP coverage and an exact protocol, address, port, and executable-path match in the manifest. Needs review means complete coverage plus an open saved alert. Otherwise the row is only observed or UNKNOWN. A count or bind address alone is not an issue verdict and does not prove external reachability.</p><div class="table-wrap"><table><thead><tr><th>Protocol</th><th>Local endpoint</th><th>Process</th><th>Review</th></tr></thead><tbody>
             $($listenerHtml -join "`n            ")
           </tbody></table></div></section>
           <section class="panel" id="changes"><div class="panel-head"><h2>Recent changes</h2><span class="panel-kicker">Last 5 journal rows</span></div><p class="panel-copy">Append-only drift journal from saved evidence; modules with incomplete coverage are omitted from change detection.</p>
             $recentChangeHtml
           </section>
+          $($moduleRecordsHtml -join "`n          ")
           <section class="panel"><div class="panel-head"><h2>Reading this report</h2><span class="panel-kicker">Evidence limits</span></div><p class="panel-copy">Freshness uses the same checker window as <code>caretaker.ps1 status</code>. DEGRADED means inventory was partial; UNKNOWN means evidence was unavailable or insufficient. Neither missing data nor a recent timestamp establishes health.</p><p class="panel-copy">Regenerate after <code>caretaker.ps1 snapshot</code> when updated evidence is needed.</p></section>
         </div>
       </div>
-      <footer>Local static report · No always-on service · No process command lines included</footer>
+      <footer>Local static report | No always-on service | No process command lines included</footer>
     </main>
   </div>
+  <script>
+    document.querySelectorAll('button.help').forEach(function(button) {
+      var tip = document.getElementById(button.getAttribute('aria-controls'));
+      function setOpen(open) {
+        button.setAttribute('aria-expanded', String(open));
+        tip.hidden = !open;
+      }
+      button.addEventListener('click', function() {
+        setOpen(true);
+      });
+      button.addEventListener('focus', function() { setOpen(true); });
+      button.addEventListener('blur', function() { setOpen(false); });
+      button.addEventListener('mouseenter', function() { setOpen(true); });
+      button.addEventListener('mouseleave', function() {
+        if (document.activeElement !== button) { setOpen(false); }
+      });
+      button.addEventListener('keydown', function(event) {
+        if (event.key === 'Escape') {
+          setOpen(false);
+        }
+      });
+    });
+  </script>
 </body>
 </html>
 "@
