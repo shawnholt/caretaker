@@ -80,6 +80,63 @@ function validPost(req, token, port) {
   return /^application\/json(?:;|$)/i.test(req.headers['content-type'] || '');
 }
 
+function isNativeCodexExe(candidate) {
+  return typeof candidate === 'string' && candidate &&
+    path.extname(candidate).toLowerCase() === '.exe' && fs.existsSync(candidate);
+}
+
+// Windows: PATH `codex` is an npm .cmd/.ps1 shim; Node cannot stdio-spawn it reliably.
+// Prefer the shim's vendor codex.exe (same binary `codex` runs), then PATH/env .exe.
+function resolveNpmWrapperCodexExe() {
+  if (process.platform !== 'win32') return null;
+  const { createRequire } = require('node:module');
+  const platformPkg = process.arch === 'arm64' ? '@openai/codex-win32-arm64' : '@openai/codex-win32-x64';
+  const triple = process.arch === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc';
+  const roots = [];
+  if (process.env.APPDATA) {
+    roots.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@openai', 'codex', 'package.json'));
+  }
+  for (const pkgJson of roots) {
+    if (!fs.existsSync(pkgJson)) continue;
+    try {
+      const req = createRequire(pkgJson);
+      const vendorPkg = req.resolve(`${platformPkg}/package.json`);
+      const exe = path.join(path.dirname(vendorPkg), 'vendor', triple, 'bin', 'codex.exe');
+      if (isNativeCodexExe(exe)) return path.resolve(exe);
+    } catch {
+      // try next root
+    }
+  }
+  return null;
+}
+
+function resolvePathCodexExe() {
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const exe = path.join(dir, 'codex.exe');
+    if (isNativeCodexExe(exe)) return path.resolve(exe);
+  }
+  return null;
+}
+
+function resolveCodexExe() {
+  const override = process.env.CARETAKER_CODEX_EXE;
+  if (override) {
+    const full = path.resolve(override);
+    if (!isNativeCodexExe(full)) {
+      throw new Error('CARETAKER_CODEX_EXE must point to an existing native codex.exe.');
+    }
+    return full;
+  }
+  const fromWrapper = resolveNpmWrapperCodexExe();
+  if (fromWrapper) return fromWrapper;
+  const fromPath = resolvePathCodexExe();
+  if (fromPath) return fromPath;
+  throw new Error(
+    'No Codex CLI found. Install the npm `@openai/codex` CLI (PATH `codex`) or put codex.exe on PATH; optional CARETAKER_CODEX_EXE override.',
+  );
+}
+
 function isolatedCodexArgs(exe) {
   const args = ['--no-daemon', '--disable', 'apps', '--disable', 'plugins'];
   let servers;
@@ -236,14 +293,13 @@ class CodexSession {
 
   async start() {
     if (this.child) return;
-    const exe = process.env.CARETAKER_CODEX_EXE || 'codex.exe';
-    if (path.extname(exe).toLowerCase() !== '.exe') throw new Error('A native codex.exe is required.');
+    const exe = resolveCodexExe();
     // Disable configured integrations using their exact transport shape, then
     // verify the resulting thread has no MCP or app tools before any turn.
     const child = spawn(exe, isolatedCodexArgs(exe), { cwd: ROOT, windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'], shell: false });
     this.child = child;
-    child.on('error', () => this.fail(new Error('Could not start native codex.exe. Check PATH or CARETAKER_CODEX_EXE.')));
+    child.on('error', () => this.fail(new Error('Could not start Codex app-server. Check PATH `codex`, codex.exe, or CARETAKER_CODEX_EXE.')));
     child.on('exit', () => this.fail(new Error('Codex app-server exited. Restart this chat server.')));
     child.stdin.on('error', () => {}); // EPIPE after child exit must not crash the server; send() reports it.
     const lines = readline.createInterface({ input: child.stdout });
@@ -537,4 +593,4 @@ function main() {
 
 if (require.main === module) main();
 module.exports = { boundedEvidence, validHost, validPost, isolatedCodexArgs, compactInventory,
-  nameQuery, callCaretakerTool, CodexSession };
+  nameQuery, callCaretakerTool, CodexSession, resolveCodexExe, resolveNpmWrapperCodexExe, resolvePathCodexExe };

@@ -13,9 +13,23 @@ function Resolve-CodexPath([string]$RequestedPath) {
     return $candidate
   }
 
+  # Prefer the npm PATH `codex` shim's vendor binary (same file the wrapper runs).
+  if ($env:APPDATA) {
+    $pkgJson = Join-Path $env:APPDATA 'npm\node_modules\@openai\codex\package.json'
+    if (Test-Path -LiteralPath $pkgJson -PathType Leaf) {
+      $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+      $platformPkg = if ($arch -eq 'arm64') { '@openai/codex-win32-arm64' } else { '@openai/codex-win32-x64' }
+      $triple = if ($arch -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+      $resolved = & node -e "const {createRequire}=require('module'); const path=require('path'); const fs=require('fs'); const req=createRequire(process.argv[1]); const pj=req.resolve(process.argv[2]+'/package.json'); const exe=path.join(path.dirname(pj),'vendor',process.argv[3],'bin','codex.exe'); if(!fs.existsSync(exe)) process.exit(2); process.stdout.write(path.resolve(exe));" $pkgJson $platformPkg $triple 2>$null
+      if ($LASTEXITCODE -eq 0 -and $resolved -and (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        return [System.IO.Path]::GetFullPath($resolved)
+      }
+    }
+  }
+
   $command = Get-Command codex.exe -CommandType Application -All -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $command -or -not (Test-Path -LiteralPath $command.Source -PathType Leaf)) {
-    throw 'No native codex.exe was found on PATH; pass -CodexPath explicitly.'
+    throw 'No Codex CLI found. Install the npm `@openai/codex` CLI (PATH `codex`) or put codex.exe on PATH; pass -CodexPath to override.'
   }
   return [System.IO.Path]::GetFullPath($command.Source)
 }

@@ -3,7 +3,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { boundedEvidence, validHost, validPost, nameQuery, callCaretakerTool, CodexSession } = require('../scripts/chat-server.js');
+const { boundedEvidence, validHost, validPost, nameQuery, callCaretakerTool, CodexSession,
+  resolveCodexExe, resolveNpmWrapperCodexExe } = require('../scripts/chat-server.js');
 
 test('chat evidence is bounded, historical, and omits raw private fields', () => {
   const fixture = path.join(__dirname, 'fixtures', 'chat-snapshot.json');
@@ -145,4 +146,23 @@ test('Caretaker tool arguments reject command text before starting a check', asy
   await assert.rejects(callCaretakerTool('resources', { processName: 'foo; Stop-Process' }), /short process name/);
   await assert.rejects(callCaretakerTool('process_details', { processId: '42' }), /valid process ID/);
   await assert.rejects(callCaretakerTool('shell', {}), /not available/);
+});
+
+test('Codex resolve prefers npm wrapper vendor exe before PATH codex.exe', () => {
+  const previous = process.env.CARETAKER_CODEX_EXE;
+  delete process.env.CARETAKER_CODEX_EXE;
+  try {
+    const wrapper = resolveNpmWrapperCodexExe();
+    if (!wrapper) {
+      assert.ok(true, 'SKIP: npm @openai/codex vendor binary not installed');
+      return;
+    }
+    assert.match(wrapper, /codex\.exe$/i);
+    assert.equal(resolveCodexExe(), wrapper);
+    process.env.CARETAKER_CODEX_EXE = wrapper;
+    assert.equal(resolveCodexExe(), wrapper);
+  } finally {
+    if (previous === undefined) delete process.env.CARETAKER_CODEX_EXE;
+    else process.env.CARETAKER_CODEX_EXE = previous;
+  }
 });
