@@ -662,10 +662,11 @@ function Get-AlertCandidates {
     if ($PreviousSnapshot -and $previousCoverage -and $previousCoverage.$moduleName) {
       $prevModuleOk = ($previousCoverage.$moduleName.status -eq 'OK')
     }
-    if ($Inventory.coverage.$moduleName.status -eq 'OK' -and $PreviousSnapshot -and $prevModuleOk -and $listener.protocol -eq 'TCP' -and -not (Test-ListenerApproved -Listener $listener -Desired $Desired)) {
+    if ($Inventory.coverage.$moduleName.status -eq 'OK' -and $listener.protocol -eq 'TCP' -and -not (Test-ListenerApproved -Listener $listener -Desired $Desired)) {
       $key = Get-ListenerKey $listener
       $id = 'unreviewed-listener:' + $key
-      $isNewObservation = (-not $previousListeners.ContainsKey($key))
+      # Without a complete prior baseline nothing is "new", but still-present open alerts must stay open.
+      $isNewObservation = $prevModuleOk -and -not $previousListeners.ContainsKey($key)
       if (-not $isNewObservation -and -not $activeAlertIds.ContainsKey($id)) { continue }
       $candidates[$id] = [pscustomobject]@{
         id = $id; rule = 'unreviewed-listener'; severity = 'review';
@@ -797,7 +798,9 @@ function Get-Freshness {
   if ($null -eq $Snapshot) { return [pscustomobject]@{ state = 'MISSING'; ageMinutes = $null; detail = 'No snapshot has been saved.' } }
   try {
     $observedAt = [DateTime]::Parse([string]$Snapshot.capturedAtUtc).ToUniversalTime()
-    $age = [Math]::Max(0, [Math]::Round(([DateTime]::UtcNow - $observedAt).TotalMinutes, 1))
+    $rawAge = ([DateTime]::UtcNow - $observedAt).TotalMinutes
+    if ($rawAge -lt -5) { return [pscustomobject]@{ state = 'UNKNOWN'; ageMinutes = $null; detail = 'Snapshot time is in the future.' } }
+    $age = [Math]::Max(0, [Math]::Round($rawAge, 1))
     $limit = [Math]::Max(15, ([int]$Config.deployment.checkIntervalMinutes * 3))
     if ($age -le $limit) { return [pscustomobject]@{ state = 'FRESH'; ageMinutes = $age; detail = "Within $limit minute freshness window." } }
     return [pscustomobject]@{ state = 'STALE'; ageMinutes = $age; detail = "Older than $limit minute freshness window." }
@@ -840,6 +843,23 @@ function Invoke-Snapshot {
     Write-Error ("Snapshot failed: {0}" -f $reason)
     throw
   }
+}
+
+function Invoke-WithEvidenceLock {
+  param([Parameter(Mandatory = $true)][scriptblock]$Body)
+  # An OS file lock (released on process exit) serializes the scheduled tick and chat-triggered snapshots.
+  if (-not (Test-Path -LiteralPath $script:EvidencePath -PathType Container)) { New-Item -ItemType Directory -Path $script:EvidencePath -Force | Out-Null }
+  $lockPath = Join-Path $script:EvidencePath 'snapshot.lock'
+  $deadline = [DateTime]::UtcNow.AddSeconds(30)
+  $lock = $null
+  while ($null -eq $lock) {
+    try { $lock = [System.IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch [System.IO.IOException] {
+      if ([DateTime]::UtcNow -ge $deadline) { throw 'Another Caretaker snapshot is still running; this attempt was skipped.' }
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  try { & $Body } finally { $lock.Dispose() }
 }
 
 function Get-AttemptHealth {
@@ -1022,8 +1042,8 @@ if (-not $LibraryOnly) {
       switch ($Action) {
         'status' { Invoke-Status }
         'doctor' { Invoke-Doctor }
-        'snapshot' { Invoke-Snapshot }
-        'tick' { Invoke-Tick }
+        'snapshot' { Invoke-WithEvidenceLock { Invoke-Snapshot } }
+        'tick' { Invoke-WithEvidenceLock { Invoke-Tick } }
         'busy' { Invoke-Busy }
         'explain' { Invoke-Explain }
         'events' { Invoke-Events }

@@ -111,9 +111,6 @@ try {
     $attentionCount = [string]$active.Count
     $attentionDetail = if ($active.Count -eq 0) { 'No open review items.' } else { 'Open items from saved alert state.' }
     foreach ($entry in $active) { if ($entry.id) { $alertKeys[[string]$entry.id] = $true } }
-  } elseif (Test-Path -LiteralPath (Join-Path $EvidenceRoot 'snapshot.json') -PathType Leaf) {
-    $attentionCount = '0'
-    $attentionDetail = 'No alert state file yet.'
   }
 } catch {
   $attentionCount = 'UNKNOWN'

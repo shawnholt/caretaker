@@ -8,36 +8,22 @@ function Assert-True {
 }
 
 $config = Get-Config
-if (-not (Test-Path -LiteralPath $script:EvidencePath -PathType Container)) {
-  New-Item -ItemType Directory -Path $script:EvidencePath -Force | Out-Null
-}
+# Real evidence is read-only here: a fabricated snapshot would become the collector's next listener baseline.
 $snapshot = Read-JsonFile -Path $script:SnapshotPath
-if ($null -eq $snapshot) {
-  $bootstrap = [pscustomobject]@{
-    schemaVersion = 1
-    capturedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-    desired = [pscustomobject]@{ schemaVersion = 1 }
-    observed = [pscustomobject]@{
-      processes = @([pscustomobject]@{ pid = 1; creationTimeUtc = '2026-01-01T00:00:00Z'; name = 'smoke.exe'; executablePath = 'C:\smoke.exe'; parentPid = 0; workingSetBytes = 1000 })
-      tcpListeners = @(); udpEndpoints = @(); services = @(); tasks = @(); startup = @()
-    }
-    coverage = [pscustomobject]@{
-      processes = [pscustomobject]@{ status = 'OK'; count = 1 }
-      tcpListeners = [pscustomobject]@{ status = 'OK'; count = 0 }
-      udpEndpoints = [pscustomobject]@{ status = 'OK'; count = 0 }
-      services = [pscustomobject]@{ status = 'OK'; count = 0 }
-      tasks = [pscustomobject]@{ status = 'OK'; count = 0 }
-      startup = [pscustomobject]@{ status = 'OK'; count = 0 }
-    }
-  }
-  Write-AtomicJson -Path $script:SnapshotPath -Value $bootstrap
-  $snapshot = $bootstrap
-}
-
+if ($null -ne $snapshot) {
+  Assert-True ($snapshot.desired.schemaVersion -eq $config.schemaVersion -and $snapshot.observed.processes.Count -gt 0) 'snapshot keeps manifest desired data separate from observed inventory'
+  Assert-True (-not ($snapshot.observed.processes[0].PSObject.Properties.Name -contains 'commandLine')) 'process command lines are not persisted'
+  Assert-True ($null -ne $snapshot.observed.services -and $null -ne $snapshot.observed.tasks -and $null -ne $snapshot.observed.startup) 'service, task, and startup inventories are present'
+} else { Write-Output 'SKIP: no saved snapshot; live snapshot shape checks need a Windows capture.' }
 Assert-True ($config.desired.approvedWorkloads.Count -eq 0 -and $config.desired.listeners.Count -eq 0) 'canonical desired workload/listener lists remain empty'
-Assert-True ($snapshot.desired.schemaVersion -eq $config.schemaVersion -and $snapshot.observed.processes.Count -gt 0) 'snapshot keeps manifest desired data separate from observed inventory'
-Assert-True (-not ($snapshot.observed.processes[0].PSObject.Properties.Name -contains 'commandLine')) 'process command lines are not persisted'
-Assert-True ($null -ne $snapshot.observed.services -and $null -ne $snapshot.observed.tasks -and $null -ne $snapshot.observed.startup) 'service, task, and startup inventories are present'
+$realOutboxPath = $script:OutboxPath
+$scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('caretaker-smoke-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+$script:EvidencePath = $scratch
+$script:AlertStatePath = Join-Path $scratch 'alert-state.json'
+$script:OutboxPath = Join-Path $scratch 'outbox.jsonl'
+$script:ChangesPath = Join-Path $scratch 'changes.jsonl'
+$script:SnapshotPath = Join-Path $scratch 'snapshot.json'
 
 $left = [pscustomobject]@{ protocol = 'TCP'; localAddress = '127.0.0.1'; localPort = 54321; process = [pscustomobject]@{ pid = 10; creationTimeUtc = '2026-01-01T00:00:00Z' } }
 $right = [pscustomobject]@{ protocol = 'TCP'; localAddress = '127.0.0.1'; localPort = 54321; process = [pscustomobject]@{ pid = 99; creationTimeUtc = '2026-02-01T00:00:00Z' } }
@@ -121,7 +107,32 @@ $partialPrevious = [pscustomobject]@{
   }
 }
 $recoveryCandidates = Get-AlertCandidates -Inventory $inventory -Desired $config.desired -PreviousSnapshot $partialPrevious
-Assert-True ($recoveryCandidates.Count -eq 0) 'TCP listener alerts stay suppressed when the prior snapshot had incomplete TCP coverage'
+Assert-True ($recoveryCandidates.Count -eq 0) 'no new TCP listener alert opens when the prior snapshot had incomplete TCP coverage'
+
+# complete -> incomplete -> complete must neither open nor resolve an alert for a still-present listener.
+Update-AlertOutbox -Candidates $afterBaselineCandidates -Coverage $inventory.coverage
+$degradedCoverage = [pscustomobject]@{ tcpListeners = [pscustomobject]@{ status = 'UNKNOWN' }; udpEndpoints = [pscustomobject]@{ status = 'OK' } }
+Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory ([pscustomobject]@{ items = $partialPrevious.observed; coverage = $degradedCoverage }) -Desired $config.desired -PreviousSnapshot $baseline) -Coverage $degradedCoverage
+Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory $inventory -Desired $config.desired -PreviousSnapshot $partialPrevious) -Coverage $inventory.coverage
+$cycleEvents = @(Get-Content -LiteralPath $script:OutboxPath | ForEach-Object { $_ | ConvertFrom-Json })
+$cycleState = Read-JsonFile -Path $script:AlertStatePath
+Assert-True ($cycleEvents.Count -eq 1 -and $cycleEvents[0].event -eq 'open' -and @($cycleState.active).Count -eq 1 -and $cycleState.active[0].seenCount -eq 2) 'coverage recovery keeps a still-present open listener alert without a false resolve or reopen'
+$goneInventory = [pscustomobject]@{ items = [pscustomobject]@{ tcpListeners = @(); udpEndpoints = @(); services = @(); tasks = @() }; coverage = $inventory.coverage }
+Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory $goneInventory -Desired $config.desired -PreviousSnapshot $partialPrevious) -Coverage $goneInventory.coverage
+Assert-True (@(Get-Content -LiteralPath $script:OutboxPath | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.event -eq 'resolved' }).Count -eq 1) 'a listener absent from a complete inventory resolves once'
+
+Assert-True ((Get-Freshness -Snapshot ([pscustomobject]@{ capturedAtUtc = [DateTime]::UtcNow.AddMinutes(30).ToString('o') }) -Config $config).state -eq 'UNKNOWN') 'future snapshot time is UNKNOWN, not fresh'
+Assert-True ((Get-Freshness -Snapshot ([pscustomobject]@{ capturedAtUtc = [DateTime]::UtcNow.AddMinutes(-1).ToString('o') }) -Config $config).state -eq 'FRESH') 'recent snapshot time is fresh'
+
+$lockPath = Join-Path $scratch 'snapshot.lock'
+$held = [System.IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
+try {
+  $lockProbe = & (Get-Process -Id $PID).Path -NoProfile -Command "try { [System.IO.File]::Open('$lockPath', 'OpenOrCreate', 'ReadWrite', 'None').Dispose(); 'acquired' } catch { 'blocked' }"
+  Assert-True ($lockProbe -eq 'blocked') 'a held evidence lock blocks a second snapshot process'
+} finally { $held.Dispose() }
+$lockRan = $false
+Invoke-WithEvidenceLock { $script:lockRan = $true }
+Assert-True ($script:lockRan) 'evidence lock is reacquired after release'
 
 $approved = [pscustomobject]@{ listeners = @([pscustomobject]@{ protocol = 'TCP'; localAddress = '127.0.0.1'; localPort = 65001; executablePath = 'C:\server.exe' }) }
 Assert-True (Test-ListenerApproved -Listener $tcpFixture -Desired $approved) 'listener approval matches the declared executable identity'
@@ -129,8 +140,8 @@ $otherProcess = [pscustomobject]@{ pid = 20; creationTimeUtc = '2026-01-01T00:00
 $otherListener = [pscustomobject]@{ protocol = 'TCP'; localAddress = '127.0.0.1'; localPort = 65001; process = $otherProcess }
 Assert-True (-not (Test-ListenerApproved -Listener $otherListener -Desired $approved)) 'a different executable cannot inherit listener approval by port alone'
 
-if (Test-Path -LiteralPath $script:OutboxPath -PathType Leaf) {
-  $events = @(Get-Content -LiteralPath $script:OutboxPath | ForEach-Object { $_ | ConvertFrom-Json })
+if (Test-Path -LiteralPath $realOutboxPath -PathType Leaf) {
+  $events = @(Get-Content -LiteralPath $realOutboxPath | ForEach-Object { $_ | ConvertFrom-Json })
   $opens = @($events | Where-Object { $_.event -eq 'open' })
   $duplicates = @($opens | Group-Object { $_.alert.id } | Where-Object { $_.Count -gt 1 })
   Assert-True ($duplicates.Count -eq 0) 'local alert outbox contains no duplicate open event for an alert identity'
@@ -147,3 +158,4 @@ Assert-True ((Get-RetentionDoctorState -Retention $retentionMissing -Installed $
 $retentionCurrent = [pscustomobject]@{ state = 'OK'; marker = 'CURRENT' }
 Assert-True ((Get-RetentionDoctorState -Retention $retentionCurrent -Installed $true) -eq 'PASS') 'current retention marker passes after tick'
 Assert-True ((Get-LeaseStartDoctorState -CaptureLaunchEnabled $false -ExpiryTaskName '') -eq 'INFO') 'disabled on-demand capture is informational by policy'
+Remove-Item -LiteralPath $scratch -Recurse -Force
