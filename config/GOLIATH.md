@@ -16,6 +16,7 @@ This is the small human context for the caretaker. Machine-readable desired/depl
 - Intel Wi-Fi/Ethernet drivers without Killer optimization or telemetry is a preference, not a verified installed adapter/driver fact. The installed hardware and driver state have not been audited here.
 - Duplicati remains the owner's backup system. The caretaker may report per-job results through a supported local source; it must not change jobs, schedules, destinations, or retention. Backup health remains `UNKNOWN` until a supported result source proves the last success/failure.
 - Observing a process repeatedly does not make it wanted or authorize stopping it. Use a small workload record and occasional review prompts; do not create a manual CMDB.
+- The chat should be fast and central to the dashboard. Put relevant findings and drilldowns beside it, explain checks in plain language, and keep a small file-based memory plus a useful bounded troubleshooting history. Proactively review meaningful event warnings/errors without adding noticeable background load. Avoid approval prompts for routine diagnostics; confirm destructive or high-impact actions against the exact target. This is a product preference, not a claim that the current chat already behaves this way or blanket permission for unrelated system changes.
 
 ## Current-state limits
 
