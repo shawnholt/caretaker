@@ -131,3 +131,4 @@ $removeFailed = Stop-CaretakerLease -StatePath $statePath5 -Backend $backend -Le
 Assert-True ($removeFailed.state -eq 'STOPPED_EXPIRY_REMOVE_FAILED' -and $removeFailed.lease.cleanupStatus -eq 'STOPPED_EXPIRY_REMOVE_FAILED') 'expiry removal failure is recorded after native collector stop'
 
 Write-Output 'Lease fixture smoke checks passed.'
+Remove-Item -LiteralPath $evidenceRoot -Recurse -Force

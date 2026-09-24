@@ -18,6 +18,8 @@ const MAX_REPLY = 12000;
 const MAX_TURNS = 12;
 const TURN_TIMEOUT = 120000;
 const IDLE_TIMEOUT = 15 * 60 * 1000;
+const LEAVE_GRACE = Number(process.env.CARETAKER_CHAT_LEAVE_GRACE_MS) || 10000;
+const CHILD_EXIT_WAIT = 5000;
 const MODULES = ['processes', 'tcpListeners', 'udpEndpoints', 'services', 'tasks', 'startup'];
 const ACTIVE_CARETAKER_CHILDREN = new Set();
 const TOOL_DEFS = [
@@ -243,6 +245,7 @@ class CodexSession {
     this.child = child;
     child.on('error', () => this.fail(new Error('Could not start native codex.exe. Check PATH or CARETAKER_CODEX_EXE.')));
     child.on('exit', () => this.fail(new Error('Codex app-server exited. Restart this chat server.')));
+    child.stdin.on('error', () => {}); // EPIPE after child exit must not crash the server; send() reports it.
     const lines = readline.createInterface({ input: child.stdout });
     lines.on('line', line => this.onLine(line));
     child.stderr.on('data', () => {}); // Drain, but never expose private diagnostics.
@@ -282,8 +285,19 @@ class CodexSession {
   }
 
   send(obj) {
-    if (!this.child || this.child.stdin.destroyed) throw new Error('Codex is unavailable.');
-    this.child.stdin.write(JSON.stringify(obj) + '\n');
+    const child = this.child;
+    if (this.closed || !child || !child.stdin.writable || child.exitCode !== null || child.signalCode) {
+      throw new Error('Codex is unavailable.');
+    }
+    child.stdin.write(JSON.stringify(obj) + '\n');
+  }
+
+  // Before the turn/start reply, the first turn-scoped event names the turn; after it, ids must match.
+  ownsTurn(turnId) {
+    if (!this.turn) return false;
+    if (typeof turnId !== 'string' || !turnId) return true;
+    if (!this.turn.id) this.turn.id = turnId;
+    return this.turn.id === turnId;
   }
 
   request(method, params, timeout) {
@@ -303,10 +317,15 @@ class CodexSession {
     if (line.length > 1024 * 1024) { this.fail(new Error('Codex response exceeded the limit.')); return; }
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
-    if (msg.method === 'item/tool/call' && msg.id !== undefined && msg.id !== null) {
-      void this.handleToolCall(msg); return;
+    if (!msg || typeof msg !== 'object') return;
+    const hasId = msg.id !== undefined && msg.id !== null;
+    if (typeof msg.method === 'string' && hasId) {
+      // Server-initiated request: never confuse it with a reply to our own id space.
+      if (msg.method === 'item/tool/call') { this.handleToolCall(msg).catch(() => {}); return; }
+      try { this.send({ id: msg.id, error: { code: -32601, message: 'Unsupported by Caretaker chat.' } }); } catch {}
+      return;
     }
-    if (msg.id !== undefined && msg.id !== null) {
+    if (hasId) {
       const pending = this.pending.get(msg.id);
       if (!pending) return;
       this.pending.delete(msg.id);
@@ -317,15 +336,15 @@ class CodexSession {
     }
     if (!this.turn || msg.params?.threadId !== this.threadId) return;
     if (msg.method === 'item/agentMessage/delta' && typeof msg.params.delta === 'string') {
+      if (!this.ownsTurn(msg.params.turnId)) return;
       this.turn.text = (this.turn.text + msg.params.delta).slice(0, MAX_REPLY);
     } else if (msg.method === 'item/completed' && msg.params.item?.type === 'agentMessage') {
+      if (!this.ownsTurn(msg.params.turnId)) return;
       const text = msg.params.item.text;
       if (typeof text === 'string') this.turn.text = text.slice(0, MAX_REPLY);
     } else if (msg.method === 'turn/completed') {
+      if (!this.ownsTurn(msg.params.turn?.id)) return;
       const active = this.turn;
-      if (!active) return;
-      const completedId = msg.params.turn?.id;
-      if (completedId && (!active.id || completedId !== active.id)) return;
       this.turn = null;
       clearTimeout(active.timer);
       if (msg.params.turn?.status !== 'completed' || msg.params.turn?.error) {
@@ -340,12 +359,11 @@ class CodexSession {
     const params = msg.params || {};
     const active = this.turn;
     if (!active || params.threadId !== this.threadId || !params.turnId ||
-        (active.id && params.turnId !== active.id) || active.toolCalls >= 6) {
-      if (this.child && !this.closed) this.send({ id: msg.id, result: { success: false,
+        !this.ownsTurn(params.turnId) || active.toolCalls >= 6) {
+      this.send({ id: msg.id, result: { success: false,
         contentItems: [{ type: 'inputText', text: 'Caretaker tool call is unavailable for this turn.' }] } });
       return;
     }
-    if (!active.id) active.id = params.turnId;
     active.toolCalls++;
     try {
       const result = await callCaretakerTool(params.tool, params.arguments);
@@ -384,6 +402,7 @@ class CodexSession {
         sandboxPolicy: { type: 'readOnly' },
       }, 15000);
       if (!result?.turn?.id) throw new Error('Codex did not start the turn.');
+      if (this.turn && this.turn.id && this.turn.id !== result.turn.id) throw new Error('Codex turn identity did not match.');
       if (this.turn) this.turn.id = result.turn.id;
       return await done;
     } catch (error) {
@@ -420,12 +439,14 @@ function main() {
   let turns = 0;
   let busy = false;
   let lastVisit = Date.now();
+  let leaveTimer = null;
   const page = fs.readFileSync(PAGE, 'utf8').replace('__CSRF_TOKEN__', token);
   let port;
   const server = http.createServer(async (req, res) => {
     lastVisit = Date.now();
     if (!validHost(req.headers.host, port)) { json(res, 403, { error: 'Invalid host.' }); return; }
     if (req.method === 'GET' && req.url === '/') {
+      clearTimeout(leaveTimer); leaveTimer = null; // A reload returns within the leave grace.
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
         'Content-Security-Policy': "default-src 'none'; script-src 'nonce-caretaker'; style-src 'nonce-caretaker'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'" });
@@ -435,6 +456,7 @@ function main() {
       if (req.headers['x-caretaker-csrf'] !== token) {
         json(res, 403, { error: 'Request rejected.' }); return;
       }
+      clearTimeout(leaveTimer); leaveTimer = null;
       try {
         await session.start();
         json(res, 200, { models: session.models,
@@ -445,11 +467,16 @@ function main() {
       }
       return;
     }
-    if (req.method !== 'POST' || !['/chat', '/close'].includes(req.url)) {
+    if (req.method !== 'POST' || !['/chat', '/close', '/leave'].includes(req.url)) {
       json(res, 404, { error: 'Not found.' }); return;
     }
     if (!validPost(req, token, port)) { json(res, 403, { error: 'Request rejected.' }); return; }
     if (req.url === '/close') { json(res, 200, { ok: true }); shutdown(); return; }
+    if (req.url === '/leave') {
+      json(res, 200, { ok: true });
+      if (!leaveTimer) leaveTimer = setTimeout(shutdown, LEAVE_GRACE);
+      return;
+    }
     if (busy) { json(res, 409, { error: 'Wait for the current reply.' }); return; }
     if (turns >= MAX_TURNS) { json(res, 429, { error: 'This session reached its 12-turn limit. Restart chat.' }); return; }
     busy = true;
@@ -485,8 +512,12 @@ function main() {
     stopping = true;
     session.close();
     server.close();
-    setTimeout(() => {
-      if (session.child && session.child.exitCode === null) {
+    server.closeAllConnections?.();
+    const deadline = Date.now() + CHILD_EXIT_WAIT;
+    const childAlive = () => session.child && session.child.exitCode === null && !session.child.signalCode;
+    (function finish() {
+      if ((childAlive() || ACTIVE_CARETAKER_CHILDREN.size) && Date.now() < deadline) { setTimeout(finish, 100); return; }
+      if (childAlive()) {
         console.error('Could not verify Codex child exit; no force kill attempted.');
         process.exitCode = 1;
       }
@@ -495,7 +526,7 @@ function main() {
         process.exitCode = 1;
       }
       process.exit();
-    }, 1200).unref();
+    })();
   }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

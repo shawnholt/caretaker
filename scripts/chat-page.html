@@ -140,11 +140,13 @@
       } catch (error) { status.textContent = error.message || 'Chat is unavailable.'; }
       finally { send.disabled = model.disabled || closing; box.focus(); }
     });
+    // pagehide also fires on reload, so the server waits briefly for the page to return before stopping.
     window.addEventListener('pagehide', () => {
-      if (closing) return; closing = true;
-      fetch('/close', { method: 'POST', keepalive: true, headers: {
+      if (closing) return;
+      fetch('/leave', { method: 'POST', keepalive: true, headers: {
         'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf }, body: '{}' }).catch(() => {});
     });
+    window.addEventListener('pageshow', event => { if (event.persisted && !closing) loadModels(); });
     stop.addEventListener('click', async () => {
       if (closing) return; closing = true;
       try { await fetch('/close', { method: 'POST', headers: {

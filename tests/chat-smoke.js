@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const { boundedEvidence, validHost, validPost, nameQuery, callCaretakerTool, CodexSession } = require('../scripts/chat-server.js');
 
 test('chat evidence is bounded, historical, and omits raw private fields', () => {
@@ -35,10 +36,84 @@ test('chat writes require the exact loopback origin and token', () => {
   assert.equal(validPost({ headers: { ...request.headers, host: 'localhost:12345' } }, 'secret', port), false);
 });
 
-test('CodexSession matches JSON-RPC replies and turn events by id', async () => {
+function fakeSession() {
   const session = new CodexSession();
-  session.child = { stdin: { destroyed: false, write() {} } };
+  const written = [];
+  session.child = { exitCode: null, signalCode: null,
+    stdin: { writable: true, write: line => written.push(JSON.parse(line)), end() { this.writable = false; } } };
   session.threadId = 'thread-1';
+  return { session, written };
+}
+
+function fakeTurn(session, id, sink) {
+  session.turn = { text: '', id, toolCalls: 0,
+    resolve: value => { sink.value = value; }, reject: assert.fail,
+    timer: setTimeout(() => assert.fail('turn timer fired'), 5000) };
+}
+
+test('a server request sharing a client id is answered, not taken as our reply', async () => {
+  const { session, written } = fakeSession();
+  let settled = false;
+  const pending = session.request('ping', {}, 5000).then(value => { settled = true; return value; });
+  session.onLine(JSON.stringify({ id: 0, method: 'item/commandExecution/requestApproval', params: {} }));
+  await new Promise(setImmediate);
+  assert.equal(settled, false);
+  assert.deepEqual(written.at(-1), { id: 0, error: { code: -32601, message: 'Unsupported by Caretaker chat.' } });
+  session.onLine(JSON.stringify({ id: 0, result: { ok: true } }));
+  assert.deepEqual(await pending, { ok: true });
+});
+
+test('turn events before the turn/start reply bind the turn; other turns are ignored', () => {
+  const { session } = fakeSession();
+  const sink = {};
+  fakeTurn(session, null, sink);
+  session.onLine(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 't1', delta: 'hi' } }));
+  session.onLine(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 't0', delta: ' stale' } }));
+  session.onLine(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't0', status: 'completed' } } }));
+  assert.equal(session.turn.text, 'hi');
+  session.onLine(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } }));
+  assert.equal(sink.value, 'hi');
+  assert.equal(session.turn, null);
+});
+
+test('a closed or exited Codex child is never written to', async () => {
+  const { session, written } = fakeSession();
+  session.child.exitCode = 0;
+  assert.throws(() => session.send({ method: 'x' }), /unavailable/);
+  session.child.exitCode = null;
+  session.close();
+  assert.throws(() => session.send({ method: 'x' }), /unavailable/);
+  session.onLine(JSON.stringify({ id: 7, method: 'item/tool/call', params: { threadId: 'thread-1', turnId: 't', tool: 'caretaker_status', arguments: {} } }));
+  session.onLine(JSON.stringify({ id: 8, method: 'unknown/request', params: {} }));
+  await new Promise(setImmediate);
+  assert.equal(written.length, 0);
+});
+
+test('page hide waits for a reload; an unreturned page stops the server', async () => {
+  const child = spawn(process.execPath, [path.join(__dirname, '..', 'scripts', 'chat-server.js')],
+    { env: { ...process.env, CARETAKER_CHAT_LEAVE_GRACE_MS: '400' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = new Promise(resolve => child.on('exit', code => resolve(code)));
+  try {
+    const port = await new Promise((resolve, reject) => {
+      child.stdout.on('data', chunk => { const m = /127\.0\.0\.1:(\d+)/.exec(String(chunk)); if (m) resolve(Number(m[1])); });
+      setTimeout(() => reject(new Error('server did not start')), 5000).unref();
+    });
+    const base = `http://127.0.0.1:${port}`;
+    const page = await (await fetch(`${base}/`)).text();
+    const token = /const csrf = '([0-9a-f]{64})'/.exec(page)[1];
+    const leave = () => fetch(`${base}/leave`, { method: 'POST', body: '{}', headers: {
+      'Content-Type': 'application/json', Origin: base, 'X-Caretaker-CSRF': token } });
+    assert.equal((await leave()).status, 200);
+    await fetch(`${base}/`);
+    await new Promise(resolve => setTimeout(resolve, 700));
+    assert.equal(child.exitCode, null, 'reload within the grace keeps the server');
+    await leave();
+    assert.equal(await Promise.race([exited, new Promise(resolve => setTimeout(() => resolve('alive'), 3000).unref())]), 0);
+  } finally { if (child.exitCode === null) child.kill(); }
+});
+
+test('CodexSession matches JSON-RPC replies and turn events by id', async () => {
+  const { session } = fakeSession();
   const first = session.request('ping', {}, 5000);
   session.onLine(JSON.stringify({ id: 99, result: { stray: true } }));
   session.onLine(JSON.stringify({ id: 0, result: { ok: true } }));
