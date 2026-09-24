@@ -58,7 +58,8 @@ $backend = New-FixtureBackend $fixture
 
 $utcCreation = Convert-LeaseCreationTimeToUtc -Value ([DateTime]::SpecifyKind([DateTime]'2026-09-23T12:00:00', [DateTimeKind]::Utc))
 Assert-True ($utcCreation.ToString('o') -eq '2026-09-23T12:00:00.0000000Z') 'DateTime CIM creation values preserve UTC identity'
-if ($IsWindows) {
+$onWindows = $env:OS -like '*Windows*'
+if ($onWindows) {
   $dmtfCreation = Convert-LeaseCreationTimeToUtc -Value '20260923120000.000000-240'
   Assert-True ($dmtfCreation.ToString('o') -eq '2026-09-23T16:00:00.0000000Z') 'DMTF CIM creation strings convert their UTC offset correctly'
 } else {

@@ -250,7 +250,7 @@ $coverageSummary = '{0} of {1} modules collected OK' -f $coverageOkCount, $cover
 $coverageSummarySafe = Html $coverageSummary
 $helpFreshness = Format-HelpButton 'Freshness' 'FRESH means the saved snapshot is within three checker intervals (same rule as caretaker status). This HTML is static; freshness was calculated when the page was generated.'
 $helpCoverage = Format-HelpButton 'Coverage' 'Counts inventory modules whose collection reported OK for this snapshot. OK means the module was collected successfully, not that Goliath is healthy.'
-$helpAttention = Format-HelpButton 'Needs attention' 'Open review items from saved alert state (for example unreviewed TCP listeners after a complete prior baseline). Repeated observation does not approve a listener.'
+$helpAttention = Format-HelpButton 'Needs attention' 'Open review items from saved alert state (for example unreviewed TCP listeners after a complete prior baseline). Personal review/snooze decisions live in the manifest and never hide this count; snooze only suppresses re-nag. Repeated observation does not approve a listener.'
 $helpCaptured = Format-HelpButton 'Captured time' 'Local time for readability; UTC is kept in saved evidence and shown below.'
 $html = @"
 <!doctype html>

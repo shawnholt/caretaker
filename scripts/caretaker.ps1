@@ -1,8 +1,11 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('status', 'doctor', 'snapshot', 'tick', 'busy', 'explain', 'events')]
+  [ValidateSet('status', 'doctor', 'snapshot', 'tick', 'busy', 'explain', 'events', 'review')]
   [string]$Action = 'status',
+  [Parameter(Position = 1)]
+  [ValidateSet('list', 'show', 'set', 'snooze', 'clear')]
+  [string]$ReviewAction = 'list',
   [ValidateRange(1, 3)]
   [int]$SampleSeconds = 1,
   [ValidateRange(1, 10)]
@@ -15,6 +18,18 @@ param(
   [int]$WindowDays = 7,
   [ValidateRange(1, 1000)]
   [int]$MaxEventsPerLog = 1000,
+  [ValidatePattern('^[A-Za-z0-9_.:|\[\]\- ]{1,200}$')]
+  [string]$AlertId = '',
+  [ValidateSet('wanted', 'optional', 'temporary', 'review', 'unknown')]
+  [string]$Class = '',
+  [ValidateLength(0, 200)]
+  [string]$Purpose = '',
+  [ValidateLength(0, 120)]
+  [string]$Project = '',
+  [ValidateLength(0, 400)]
+  [string]$Note = '',
+  [ValidateRange(1, 90)]
+  [int]$Days = 7,
   [switch]$LibraryOnly
 )
 
@@ -82,7 +97,68 @@ function Get-Config {
   if ($null -eq $config.desired.approvedWorkloads -or $null -eq $config.desired.listeners) {
     throw 'Manifest must define desired.approvedWorkloads and desired.listeners arrays.'
   }
+  if (-not ($config.PSObject.Properties.Name -contains 'decisions') -or $null -eq $config.decisions) {
+    $config | Add-Member -NotePropertyName decisions -NotePropertyValue ([pscustomobject]@{ items = @() }) -Force
+  } elseif (-not ($config.decisions.PSObject.Properties.Name -contains 'items') -or $null -eq $config.decisions.items) {
+    $config.decisions | Add-Member -NotePropertyName items -NotePropertyValue @() -Force
+  }
   return $config
+}
+
+function Get-DecisionItems {
+  param($Config)
+  if ($null -eq $Config -or $null -eq $Config.decisions) { return @() }
+  return @($Config.decisions.items)
+}
+
+function Find-Decision {
+  param($Config, [Parameter(Mandatory = $true)][string]$AlertId)
+  foreach ($item in @(Get-DecisionItems -Config $Config)) {
+    if ([string]$item.alertId -eq $AlertId) { return $item }
+  }
+  return $null
+}
+
+function Test-AlertSnoozed {
+  param($Config, [Parameter(Mandatory = $true)][string]$AlertId, [DateTime]$NowUtc = [DateTime]::UtcNow)
+  $item = Find-Decision -Config $Config -AlertId $AlertId
+  if ($null -eq $item) { return $false }
+  $until = [string]$item.snoozeUntilUtc
+  if ([string]::IsNullOrWhiteSpace($until)) { return $false }
+  $deadline = [DateTime]::MinValue
+  if (-not [DateTime]::TryParse($until, [ref]$deadline)) { return $false }
+  return ($deadline.ToUniversalTime() -gt $NowUtc.ToUniversalTime())
+}
+
+function Save-ConfigDecisions {
+  param(
+    [Parameter(Mandatory = $true)]$Config,
+    [AllowEmptyCollection()]
+    [Parameter(Mandatory = $true)][object[]]$Items
+  )
+  $next = [pscustomobject]@{
+    schemaVersion = $Config.schemaVersion
+    product = $Config.product
+    deployment = $Config.deployment
+    notifications = $Config.notifications
+    leasePolicy = $Config.leasePolicy
+    desired = $Config.desired
+    decisions = [pscustomobject]@{ items = @($Items) }
+  }
+  Write-AtomicJson -Path $script:ConfigPath -Value $next
+}
+
+function Get-SnapshotDesired {
+  # Personal decisions stay in the manifest only; evidence snapshots omit them.
+  param([Parameter(Mandatory = $true)]$Config)
+  return [pscustomobject]@{
+    schemaVersion = $Config.schemaVersion
+    product = $Config.product
+    deployment = $Config.deployment
+    notifications = $Config.notifications
+    leasePolicy = $Config.leasePolicy
+    desired = $Config.desired
+  }
 }
 
 function Get-TaskState {
@@ -697,11 +773,12 @@ function Get-AlertCandidates {
 }
 
 function Update-AlertOutbox {
-  param([hashtable]$Candidates, $Coverage)
+  param([hashtable]$Candidates, $Coverage, $Config)
   $old = Read-JsonFile -Path $script:AlertStatePath
   $previous = @{}
   if ($old -and $old.active) { foreach ($entry in @($old.active)) { $previous[[string]$entry.id] = $entry } }
   $now = Get-UtcStamp
+  $nowUtc = [DateTime]::UtcNow
   $next = @()
   foreach ($id in @($Candidates.Keys | Sort-Object)) {
     $candidate = $Candidates[$id]
@@ -711,7 +788,10 @@ function Update-AlertOutbox {
     } else {
       $record = [pscustomobject]@{ id = $id; rule = $candidate.rule; severity = $candidate.severity; subject = $candidate.subject; firstSeenUtc = $now; lastSeenUtc = $now; seenCount = 1 }
       $next += $record
-      Add-JsonLine -Path $script:OutboxPath -Value ([pscustomobject]@{ event = 'open'; atUtc = $now; alert = $record })
+      # Snooze keeps Needs-attention/active state; it only suppresses outbox re-nag.
+      if (-not (Test-AlertSnoozed -Config $Config -AlertId $id -NowUtc $nowUtc)) {
+        Add-JsonLine -Path $script:OutboxPath -Value ([pscustomobject]@{ event = 'open'; atUtc = $now; alert = $record })
+      }
     }
   }
   foreach ($id in @($previous.Keys)) {
@@ -816,11 +896,11 @@ function Invoke-SnapshotCore {
     schemaVersion = 1
     capturedAtUtc = Get-UtcStamp
     machineName = $env:COMPUTERNAME
-    desired = $config
+    desired = (Get-SnapshotDesired -Config $config)
     observed = $inventory.items
     coverage = $inventory.coverage
   }
-  Update-AlertOutbox -Candidates $candidates -Coverage $inventory.coverage
+  Update-AlertOutbox -Candidates $candidates -Coverage $inventory.coverage -Config $config
   Update-ChangeLog -PreviousSnapshot $previous -Snapshot $snapshot
   Write-AtomicJson -Path $script:SnapshotPath -Value $snapshot
   Write-Output "Snapshot saved: $script:SnapshotPath"
@@ -1034,6 +1114,121 @@ function Invoke-Tick {
   if ($failures.Count -gt 0) { throw ($failures -join ' ') }
 }
 
+function Invoke-Review {
+  $config = Get-Config
+  $nowUtc = [DateTime]::UtcNow
+  switch ($ReviewAction) {
+    'list' {
+      $alertState = $null
+      try { $alertState = Read-JsonFile -Path $script:AlertStatePath } catch { $alertState = $null }
+      $active = if ($alertState -and $alertState.active) { @($alertState.active) } else { @() }
+      $decisions = @(Get-DecisionItems -Config $config)
+      Write-Output 'Goliath Caretaker review'
+      Write-Output ("Active alerts (Needs attention): {0}" -f $active.Count)
+      Write-Output 'Snooze suppresses re-nag only; open alerts stay visible.'
+      foreach ($alert in ($active | Sort-Object { [string]$_.id })) {
+        $id = [string]$alert.id
+        $decision = Find-Decision -Config $config -AlertId $id
+        $class = if ($decision -and $decision.class) { [string]$decision.class } else { 'none' }
+        $snoozed = Test-AlertSnoozed -Config $config -AlertId $id -NowUtc $nowUtc
+        $until = if ($decision -and $decision.snoozeUntilUtc) { [string]$decision.snoozeUntilUtc } else { '' }
+        $snoozeLabel = if ($snoozed) { "snoozed until $until" } elseif ($until) { "snooze expired ($until)" } else { 'not snoozed' }
+        Write-Output ("- {0} | {1} | class={2}; {3}" -f $id, [string]$alert.subject, $class, $snoozeLabel)
+      }
+      $orphan = @($decisions | Where-Object {
+        $id = [string]$_.alertId
+        -not ($active | Where-Object { [string]$_.id -eq $id })
+      })
+      if ($orphan.Count -gt 0) {
+        Write-Output ("Personal decisions without a current open alert: {0}" -f $orphan.Count)
+        foreach ($item in ($orphan | Sort-Object { [string]$_.alertId })) {
+          Write-Output ("- {0} | class={1}; reviewed={2}" -f [string]$item.alertId, [string]$item.class, [string]$item.reviewedAtUtc)
+        }
+      }
+    }
+    'show' {
+      if ([string]::IsNullOrWhiteSpace($AlertId)) { throw 'review show requires -AlertId.' }
+      $decision = Find-Decision -Config $config -AlertId $AlertId
+      $alertState = $null
+      try { $alertState = Read-JsonFile -Path $script:AlertStatePath } catch { $alertState = $null }
+      $active = $null
+      if ($alertState -and $alertState.active) { $active = @($alertState.active | Where-Object { [string]$_.id -eq $AlertId } | Select-Object -First 1) }
+      Write-Output ("alertId: {0}" -f $AlertId)
+      Write-Output ("openAlert: {0}" -f $(if ($active) { 'yes' } else { 'no' }))
+      if ($active) { Write-Output ("subject: {0}" -f [string]$active.subject) }
+      if ($null -eq $decision) {
+        Write-Output 'decision: none'
+      } else {
+        Write-Output ("class: {0}" -f [string]$decision.class)
+        Write-Output ("purpose: {0}" -f [string]$decision.purpose)
+        Write-Output ("project: {0}" -f [string]$decision.project)
+        Write-Output ("note: {0}" -f [string]$decision.note)
+        Write-Output ("reviewedAtUtc: {0}" -f [string]$decision.reviewedAtUtc)
+        Write-Output ("snoozeUntilUtc: {0}" -f $(if ($decision.snoozeUntilUtc) { [string]$decision.snoozeUntilUtc } else { '' }))
+        Write-Output ("snoozedNow: {0}" -f (Test-AlertSnoozed -Config $config -AlertId $AlertId -NowUtc $nowUtc))
+      }
+    }
+    'set' {
+      if ([string]::IsNullOrWhiteSpace($AlertId)) { throw 'review set requires -AlertId.' }
+      if ([string]::IsNullOrWhiteSpace($Class)) { throw 'review set requires -Class wanted|optional|temporary|review|unknown.' }
+      $items = @(Get-DecisionItems -Config $config)
+      $existing = $null
+      $nextItems = @()
+      foreach ($item in $items) {
+        if ([string]$item.alertId -eq $AlertId) { $existing = $item } else { $nextItems += $item }
+      }
+      $record = [pscustomobject]@{
+        alertId = $AlertId
+        class = $Class
+        purpose = $(if (-not [string]::IsNullOrWhiteSpace($Purpose)) { $Purpose } elseif ($existing) { [string]$existing.purpose } else { '' })
+        project = $(if (-not [string]::IsNullOrWhiteSpace($Project)) { $Project } elseif ($existing) { [string]$existing.project } else { '' })
+        note = $(if (-not [string]::IsNullOrWhiteSpace($Note)) { $Note } elseif ($existing) { [string]$existing.note } else { '' })
+        reviewedAtUtc = Get-UtcStamp
+        snoozeUntilUtc = if ($existing -and $existing.snoozeUntilUtc) { [string]$existing.snoozeUntilUtc } else { $null }
+      }
+      $nextItems += $record
+      Save-ConfigDecisions -Config $config -Items $nextItems
+      Add-CaretakerLogEntry -Label 'caretaker-review-set' -Outcome ("recorded class=$Class for $AlertId")
+      Write-Output ("Recorded personal decision for {0}: class={1}" -f $AlertId, $Class)
+      Write-Output 'Decision written only to config/caretaker.json; evidence/alert state was not changed.'
+    }
+    'snooze' {
+      if ([string]::IsNullOrWhiteSpace($AlertId)) { throw 'review snooze requires -AlertId.' }
+      $until = $nowUtc.AddDays($Days).ToString('o')
+      $items = @(Get-DecisionItems -Config $config)
+      $existing = $null
+      $nextItems = @()
+      foreach ($item in $items) {
+        if ([string]$item.alertId -eq $AlertId) { $existing = $item } else { $nextItems += $item }
+      }
+      $record = [pscustomobject]@{
+        alertId = $AlertId
+        class = if ($existing -and $existing.class) { [string]$existing.class } else { 'review' }
+        purpose = if ($existing) { [string]$existing.purpose } else { '' }
+        project = if ($existing) { [string]$existing.project } else { '' }
+        note = if ($existing) { [string]$existing.note } else { '' }
+        reviewedAtUtc = if ($existing -and $existing.reviewedAtUtc) { [string]$existing.reviewedAtUtc } else { Get-UtcStamp }
+        snoozeUntilUtc = $until
+      }
+      $nextItems += $record
+      Save-ConfigDecisions -Config $config -Items $nextItems
+      Add-CaretakerLogEntry -Label 'caretaker-review-snooze' -Outcome ("snoozed $AlertId until $until")
+      Write-Output ("Snoozed re-nag for {0} until {1}" -f $AlertId, $until)
+      Write-Output 'Needs attention / open alerts stay visible; only outbox re-nag is suppressed while snoozed.'
+    }
+    'clear' {
+      if ([string]::IsNullOrWhiteSpace($AlertId)) { throw 'review clear requires -AlertId.' }
+      $items = @(Get-DecisionItems -Config $config)
+      $kept = @($items | Where-Object { [string]$_.alertId -ne $AlertId })
+      if ($kept.Count -eq $items.Count) { throw "No personal decision found for alertId $AlertId." }
+      Save-ConfigDecisions -Config $config -Items $kept
+      Add-CaretakerLogEntry -Label 'caretaker-review-clear' -Outcome ("cleared decision for $AlertId")
+      Write-Output ("Cleared personal decision for {0}" -f $AlertId)
+      Write-Output 'Open alerts and Needs attention are unchanged.'
+    }
+  }
+}
+
 if (-not $LibraryOnly) {
   $exitCode = 0
   try {
@@ -1047,6 +1242,7 @@ if (-not $LibraryOnly) {
         'busy' { Invoke-Busy }
         'explain' { Invoke-Explain }
         'events' { Invoke-Events }
+        'review' { Invoke-Review }
       }
     } *>&1)
   } catch {

@@ -16,6 +16,7 @@ if ($null -ne $snapshot) {
   Assert-True ($null -ne $snapshot.observed.services -and $null -ne $snapshot.observed.tasks -and $null -ne $snapshot.observed.startup) 'service, task, and startup inventories are present'
 } else { Write-Output 'SKIP: no saved snapshot; live snapshot shape checks need a Windows capture.' }
 Assert-True ($config.desired.approvedWorkloads.Count -eq 0 -and $config.desired.listeners.Count -eq 0) 'canonical desired workload/listener lists remain empty'
+Assert-True ($config.decisions.items.Count -eq 0) 'canonical personal decisions list starts empty'
 $realOutboxPath = $script:OutboxPath
 $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('caretaker-smoke-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch -Force | Out-Null
@@ -110,16 +111,55 @@ $recoveryCandidates = Get-AlertCandidates -Inventory $inventory -Desired $config
 Assert-True ($recoveryCandidates.Count -eq 0) 'no new TCP listener alert opens when the prior snapshot had incomplete TCP coverage'
 
 # complete -> incomplete -> complete must neither open nor resolve an alert for a still-present listener.
-Update-AlertOutbox -Candidates $afterBaselineCandidates -Coverage $inventory.coverage
+Update-AlertOutbox -Candidates $afterBaselineCandidates -Coverage $inventory.coverage -Config $config
 $degradedCoverage = [pscustomobject]@{ tcpListeners = [pscustomobject]@{ status = 'UNKNOWN' }; udpEndpoints = [pscustomobject]@{ status = 'OK' } }
-Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory ([pscustomobject]@{ items = $partialPrevious.observed; coverage = $degradedCoverage }) -Desired $config.desired -PreviousSnapshot $baseline) -Coverage $degradedCoverage
-Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory $inventory -Desired $config.desired -PreviousSnapshot $partialPrevious) -Coverage $inventory.coverage
+Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory ([pscustomobject]@{ items = $partialPrevious.observed; coverage = $degradedCoverage }) -Desired $config.desired -PreviousSnapshot $baseline) -Coverage $degradedCoverage -Config $config
+Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory $inventory -Desired $config.desired -PreviousSnapshot $partialPrevious) -Coverage $inventory.coverage -Config $config
 $cycleEvents = @(Get-Content -LiteralPath $script:OutboxPath | ForEach-Object { $_ | ConvertFrom-Json })
 $cycleState = Read-JsonFile -Path $script:AlertStatePath
 Assert-True ($cycleEvents.Count -eq 1 -and $cycleEvents[0].event -eq 'open' -and @($cycleState.active).Count -eq 1 -and $cycleState.active[0].seenCount -eq 2) 'coverage recovery keeps a still-present open listener alert without a false resolve or reopen'
 $goneInventory = [pscustomobject]@{ items = [pscustomobject]@{ tcpListeners = @(); udpEndpoints = @(); services = @(); tasks = @() }; coverage = $inventory.coverage }
-Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory $goneInventory -Desired $config.desired -PreviousSnapshot $partialPrevious) -Coverage $goneInventory.coverage
+Update-AlertOutbox -Candidates (Get-AlertCandidates -Inventory $goneInventory -Desired $config.desired -PreviousSnapshot $partialPrevious) -Coverage $goneInventory.coverage -Config $config
 Assert-True (@(Get-Content -LiteralPath $script:OutboxPath | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.event -eq 'resolved' }).Count -eq 1) 'a listener absent from a complete inventory resolves once'
+
+# Snooze suppresses outbox re-nag but keeps Needs-attention/active alert state.
+$snoozeScratch = Join-Path $scratch 'snooze-case'
+New-Item -ItemType Directory -Path $snoozeScratch -Force | Out-Null
+$script:AlertStatePath = Join-Path $snoozeScratch 'alert-state.json'
+$script:OutboxPath = Join-Path $snoozeScratch 'outbox.jsonl'
+$snoozeAlertId = 'unreviewed-listener:' + (Get-ListenerKey $tcpFixture)
+$snoozeConfig = [pscustomobject]@{
+  schemaVersion = 1
+  product = $config.product
+  deployment = $config.deployment
+  notifications = $config.notifications
+  leasePolicy = $config.leasePolicy
+  desired = $config.desired
+  decisions = [pscustomobject]@{
+    items = @(
+      [pscustomobject]@{
+        alertId = $snoozeAlertId
+        class = 'review'
+        purpose = 'fixture'
+        project = 'smoke'
+        note = ''
+        reviewedAtUtc = '2026-09-23T00:00:00Z'
+        snoozeUntilUtc = [DateTime]::UtcNow.AddDays(2).ToString('o')
+      }
+    )
+  }
+}
+Assert-True (Test-AlertSnoozed -Config $snoozeConfig -AlertId $snoozeAlertId) 'active snoozeUntilUtc marks an alert snoozed'
+Assert-True (-not (Test-AlertSnoozed -Config $snoozeConfig -AlertId $snoozeAlertId -NowUtc ([DateTime]::UtcNow.AddDays(3)))) 'expired snooze no longer suppresses nag'
+Update-AlertOutbox -Candidates $afterBaselineCandidates -Coverage $inventory.coverage -Config $snoozeConfig
+$snoozeState = Read-JsonFile -Path $script:AlertStatePath
+$snoozeEvents = @(Get-Content -LiteralPath $script:OutboxPath -ErrorAction SilentlyContinue | ForEach-Object { $_ | ConvertFrom-Json })
+Assert-True (@($snoozeState.active).Count -eq 1 -and $snoozeState.active[0].id -eq $snoozeAlertId) 'snoozed alert remains in active Needs-attention state'
+Assert-True ($snoozeEvents.Count -eq 0) 'snooze suppresses the outbox open re-nag event'
+$snapshotDesired = Get-SnapshotDesired -Config $snoozeConfig
+Assert-True (-not ($snapshotDesired.PSObject.Properties.Name -contains 'decisions')) 'evidence snapshot desired blob omits personal decisions'
+$script:AlertStatePath = Join-Path $scratch 'alert-state.json'
+$script:OutboxPath = Join-Path $scratch 'outbox.jsonl'
 
 Assert-True ((Get-Freshness -Snapshot ([pscustomobject]@{ capturedAtUtc = [DateTime]::UtcNow.AddMinutes(30).ToString('o') }) -Config $config).state -eq 'UNKNOWN') 'future snapshot time is UNKNOWN, not fresh'
 Assert-True ((Get-Freshness -Snapshot ([pscustomobject]@{ capturedAtUtc = [DateTime]::UtcNow.AddMinutes(-1).ToString('o') }) -Config $config).state -eq 'FRESH') 'recent snapshot time is fresh'
@@ -158,4 +198,38 @@ Assert-True ((Get-RetentionDoctorState -Retention $retentionMissing -Installed $
 $retentionCurrent = [pscustomobject]@{ state = 'OK'; marker = 'CURRENT' }
 Assert-True ((Get-RetentionDoctorState -Retention $retentionCurrent -Installed $true) -eq 'PASS') 'current retention marker passes after tick'
 Assert-True ((Get-LeaseStartDoctorState -CaptureLaunchEnabled $false -ExpiryTaskName '') -eq 'INFO') 'disabled on-demand capture is informational by policy'
+
+# review is the only writer of personal decisions into the canonical manifest.
+$realConfigPath = $script:ConfigPath
+$reviewConfigPath = Join-Path $scratch 'caretaker-review.json'
+$baseReviewConfig = [pscustomobject]@{
+  schemaVersion = 1
+  product = $config.product
+  deployment = $config.deployment
+  notifications = $config.notifications
+  leasePolicy = $config.leasePolicy
+  desired = $config.desired
+  decisions = [pscustomobject]@{ items = @() }
+}
+Write-AtomicJson -Path $reviewConfigPath -Value $baseReviewConfig
+$script:ConfigPath = $reviewConfigPath
+$ReviewAction = 'set'
+$AlertId = $snoozeAlertId
+$Class = 'optional'
+$Purpose = 'local smoke fixture'
+$Project = 'caretaker'
+$Note = 'keep visible'
+Invoke-Review
+$afterSet = Get-Config
+Assert-True ($afterSet.decisions.items.Count -eq 1 -and $afterSet.decisions.items[0].class -eq 'optional' -and $afterSet.decisions.items[0].purpose -eq 'local smoke fixture') 'review set writes one personal decision into the manifest'
+$ReviewAction = 'snooze'
+$Days = 3
+Invoke-Review
+$afterSnooze = Get-Config
+Assert-True (Test-AlertSnoozed -Config $afterSnooze -AlertId $snoozeAlertId) 'review snooze records an active snoozeUntilUtc'
+$ReviewAction = 'clear'
+Invoke-Review
+$afterClear = Get-Config
+Assert-True ($afterClear.decisions.items.Count -eq 0) 'review clear removes the personal decision without touching evidence'
+$script:ConfigPath = $realConfigPath
 Remove-Item -LiteralPath $scratch -Recurse -Force
