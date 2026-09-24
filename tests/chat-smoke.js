@@ -16,8 +16,23 @@ test('chat page prioritizes accessible questions and evidence provenance', () =>
     "fetch('/summary', { cache: 'no-store', headers: { 'x-caretaker-csrf': csrf } })",
     'Snapshot captured (UTC)', 'Collection coverage',
     'point-in-time context. It does not describe live system status',
-    'No fresh Caretaker checks used.', 'check?.completed === true', "typeof check?.state === 'string'",
+    'No structured checks used; local commands may still have been used.', 'check?.completed === true', "typeof check?.state === 'string'",
   ]) assert.ok(page.includes(fragment), `chat page should include ${fragment}`);
+});
+
+test('chat approval UI shows exact request details and requires an explicit decision', () => {
+  const page = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'chat-page.html'), 'utf8');
+  for (const fragment of [
+    'id="approval-card"', 'aria-live="assertive"', 'Approval needed',
+    'Nothing is approved automatically.', 'id="approval-allow" type="button">Allow once',
+    'id="approval-deny" class="approval-deny" type="button">Deny',
+    "fetch('/approval', { cache: 'no-store', headers: { 'x-caretaker-csrf': csrf } })",
+    "JSON.stringify({ id, decision })", "decideApproval('accept')", "decideApproval('decline')",
+    "addApprovalDetail('Command', approval.command)", "addApprovalDetail('Working directory', approval.cwd)",
+    "addApprovalDetail('File or permission details', approval.details)",
+    'function startApprovalPolling()', 'setTimeout(pollApproval, 500)',
+    'if (!chatPending || closing || approvalPollBusy) return', 'stopApprovalPolling();',
+  ]) assert.ok(page.includes(fragment), `approval UI should include ${fragment}`);
 });
 
 test('chat evidence is bounded, historical, and omits raw private fields', () => {
@@ -73,9 +88,97 @@ test('a server request sharing a client id is answered, not taken as our reply',
   session.onLine(JSON.stringify({ id: 0, method: 'item/commandExecution/requestApproval', params: {} }));
   await new Promise(setImmediate);
   assert.equal(settled, false);
-  assert.deepEqual(written.at(-1), { id: 0, error: { code: -32601, message: 'Unsupported by Caretaker chat.' } });
+  assert.deepEqual(written.at(-1), { id: 0, result: { decision: 'decline' } });
   session.onLine(JSON.stringify({ id: 0, result: { ok: true } }));
   assert.deepEqual(await pending, { ok: true });
+});
+
+test('full-access command waits for the exact user decision', () => {
+  const { session, written } = fakeSession();
+  fakeTurn(session, 'turn-1', {});
+  session.onLine(JSON.stringify({ id: 12, method: 'item/commandExecution/requestApproval',
+    params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1',
+      command: 'Set-Content evidence/test.txt ok', cwd: 'C:\\caretaker',
+      availableDecisions: ['accept', 'decline'] } }));
+  const approval = session.approvalView();
+  assert.equal(approval.kind, 'command');
+  assert.match(approval.command, /Set-Content/);
+  assert.equal(written.length, 0, 'a pending command is not auto-approved');
+  assert.equal(session.resolveApproval('wrong-id', 'accept'), false);
+  assert.equal(written.length, 0);
+  assert.equal(session.resolveApproval(approval.id, 'accept'), true);
+  assert.deepEqual(written, [{ id: 12, result: { decision: 'accept' } }]);
+  assert.equal(session.approvalView(), null);
+  session.turn.reject = () => {};
+  session.close();
+});
+
+test('unmatched approval is denied and Stop declines a pending command', () => {
+  const { session, written } = fakeSession();
+  fakeTurn(session, 'turn-1', {});
+  session.onLine(JSON.stringify({ id: 13, method: 'item/commandExecution/requestApproval',
+    params: { threadId: 'other-thread', turnId: 'turn-1', itemId: 'wrong' } }));
+  assert.deepEqual(written.pop(), { id: 13, result: { decision: 'decline' } });
+  session.onLine(JSON.stringify({ id: 14, method: 'item/commandExecution/requestApproval',
+    params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'pending', command: 'whoami' } }));
+  assert.ok(session.approvalView());
+  session.turn.reject = () => {};
+  session.close();
+  assert.deepEqual(written.pop(), { id: 14, result: { decision: 'decline' } });
+  assert.equal(session.approvalView(), null);
+});
+
+test('file approvals show the proposed patch and permission grants stay turn-scoped', () => {
+  const { session, written } = fakeSession();
+  fakeTurn(session, 'turn-1', {});
+  session.onLine(JSON.stringify({ method: 'item/fileChange/patchUpdated', params: {
+    threadId: 'thread-1', turnId: 'turn-1', itemId: 'patch-1',
+    changes: [{ path: 'evidence/test.txt', kind: 'add', diff: '+approved' }] } }));
+  session.onLine(JSON.stringify({ id: 20, method: 'item/fileChange/requestApproval', params: {
+    threadId: 'thread-1', turnId: 'turn-1', itemId: 'patch-1' } }));
+  const patch = session.approvalView();
+  assert.match(patch.details, /evidence\/test.txt/);
+  assert.match(patch.details, /\+approved/);
+  assert.equal(session.resolveApproval(patch.id, 'accept'), true);
+  assert.deepEqual(written.pop(), { id: 20, result: { decision: 'accept' } });
+  session.onLine(JSON.stringify({ id: 21, method: 'item/permissions/requestApproval', params: {
+    threadId: 'thread-1', turnId: 'turn-1', itemId: 'permissions-1', cwd: 'C:\\caretaker',
+    permissions: { fileSystem: { read: ['C:\\Windows'] } } } }));
+  const grant = session.approvalView();
+  assert.equal(grant.kind, 'permissions');
+  assert.equal(session.resolveApproval(grant.id, 'accept'), true);
+  assert.deepEqual(written.pop(), { id: 21, result: { permissions: {
+    fileSystem: { read: ['C:\\Windows'] } }, scope: 'turn' } });
+  session.turn.reject = () => {};
+  session.close();
+});
+
+test('file patch without a preview is declined before user approval', () => {
+  const { session, written } = fakeSession();
+  fakeTurn(session, 'turn-1', {});
+  session.onLine(JSON.stringify({ id: 22, method: 'item/fileChange/requestApproval', params: {
+    threadId: 'thread-1', turnId: 'turn-1', itemId: 'no-preview' } }));
+  assert.deepEqual(written, [{ id: 22, result: { decision: 'decline' } }]);
+  assert.equal(session.approvalView(), null);
+  session.onLine(JSON.stringify({ method: 'item/started', params: {
+    threadId: 'thread-1', turnId: 'turn-1', item: { type: 'fileChange', id: 'patch-2',
+      changes: [{ path: 'evidence/from-item.txt', kind: 'add', diff: '+approved' }] } } }));
+  session.onLine(JSON.stringify({ id: 23, method: 'item/fileChange/requestApproval', params: {
+    threadId: 'thread-1', turnId: 'turn-1', itemId: 'patch-2' } }));
+  assert.match(session.approvalView().details, /from-item.txt/);
+  session.turn.reject = () => {};
+  session.close();
+});
+
+test('approval never hides the tail of an oversized command', () => {
+  const { session, written } = fakeSession();
+  fakeTurn(session, 'turn-1', {});
+  session.onLine(JSON.stringify({ id: 24, method: 'item/commandExecution/requestApproval', params: {
+    threadId: 'thread-1', turnId: 'turn-1', itemId: 'long-command', command: 'x'.repeat(8001) } }));
+  assert.deepEqual(written, [{ id: 24, result: { decision: 'decline' } }]);
+  assert.equal(session.approvalView(), null);
+  session.turn.reject = () => {};
+  session.close();
 });
 
 test('turn events before the turn/start reply bind the turn; other turns are ignored', () => {

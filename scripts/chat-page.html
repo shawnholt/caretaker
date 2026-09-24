@@ -44,6 +44,14 @@
   .stop { background: #3b2630; color: #fecdd3; border: 1px solid #77404b }
   .stop:hover:not(:disabled) { background: #58313d }
   #status { color: #fcd34d; min-height: 1.5rem; margin: .6rem 0 0 }
+  #approval-card { margin: 0 0 1rem; padding: 1rem; border: 2px solid #fbbf24; border-radius: .7rem; background: #292313 }
+  #approval-card[hidden] { display: none }
+  #approval-card h2 { margin: 0 0 .4rem; font-size: 1rem; color: #fde68a }
+  #approval-card p { margin: .35rem 0 }
+  #approval-details dd { margin: .2rem 0 .65rem; overflow-wrap: anywhere; white-space: pre-wrap }
+  #approval-card pre { overflow-wrap: anywhere; white-space: pre-wrap; margin: .3rem 0 .7rem; padding: .65rem; border-radius: .4rem; background: #17140c; font: .86rem/1.45 ui-monospace, monospace }
+  .approval-actions { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: .8rem }
+  .approval-deny { background: #3b2630; color: #fecdd3; border: 1px solid #77404b }
   aside { padding: 1rem }
   aside h2 { font-size: 1rem; margin: 0 }
   .panel-intro { color: var(--muted); font-size: .86rem; margin: .25rem 0 .8rem }
@@ -71,7 +79,7 @@
   <header>
     <div>
       <h1>Goliath Caretaker</h1>
-      <p class="sub">Ask a question. Caretaker evidence is read-only; missing evidence stays UNKNOWN.</p>
+      <p class="sub">Ask questions or request local changes. Review each command or file change before it runs.</p>
     </div>
     <div class="header-actions">
       <label for="model">Model<select id="model" disabled><option>Loading models…</option></select></label>
@@ -81,8 +89,18 @@
   <main class="layout">
     <section class="chat" aria-label="Caretaker conversation">
       <div id="transcript" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Chat answers and questions">
-        <div class="welcome" id="welcome"><strong>What would you like to know?</strong>Ask about current activity, resource use, a process, or recent system events. Replies should identify evidence time and coverage.</div>
+        <div class="welcome" id="welcome"><strong>What would you like to know or change?</strong>Ask about current activity, resource use, a process, recent events, or a specific system change. Caretaker uses your Windows account permissions and asks before running commands or changing files.</div>
       </div>
+      <section id="approval-card" aria-labelledby="approval-title" aria-describedby="approval-summary" aria-live="assertive" hidden>
+        <h2 id="approval-title">Approval needed</h2>
+        <p id="approval-summary">Caretaker is waiting for your decision. Nothing is approved automatically.</p>
+        <dl id="approval-details"></dl>
+        <div class="approval-actions">
+          <button id="approval-allow" type="button">Allow once</button>
+          <button id="approval-deny" class="approval-deny" type="button">Deny</button>
+        </div>
+        <p id="approval-status" role="status" aria-live="polite"></p>
+      </section>
       <form id="form" class="composer">
         <div class="composer-head">
           <label for="message">Your question</label>
@@ -90,7 +108,7 @@
         </div>
         <textarea id="message" maxlength="3000" required aria-describedby="question-hint" placeholder="Ask about Goliath's current state…"></textarea>
         <div class="composer-actions">
-          <span id="question-hint" class="hint">Current questions use read-only Caretaker checks. The saved snapshot is historical context.</span>
+          <span id="question-hint" class="hint">Structured checks are read-only. Other local commands and file changes need your approval. The saved snapshot is historical context.</span>
           <button id="send" type="submit" disabled>Ask Caretaker</button>
         </div>
         <p id="status" role="status" aria-live="polite"></p>
@@ -135,7 +153,16 @@
     const coverage = document.getElementById('coverage');
     const summaryStatus = document.getElementById('summary-status');
     const refreshSummary = document.getElementById('refresh-summary');
+    const approvalCard = document.getElementById('approval-card');
+    const approvalDetails = document.getElementById('approval-details');
+    const approvalStatus = document.getElementById('approval-status');
+    const approvalAllow = document.getElementById('approval-allow');
+    const approvalDeny = document.getElementById('approval-deny');
     let closing = false;
+    let chatPending = false;
+    let approvalPollTimer = null;
+    let approvalPollBusy = false;
+    let activeApproval = null;
     function appendInline(parent, text) {
       const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
       let cursor = 0;
@@ -194,9 +221,9 @@
         const meta = document.createElement('div'); meta.className = 'answer-meta';
         const received = document.createElement('div'); received.textContent = `Reply received (local time): ${receivedAt}.`;
         meta.append(received);
-        const evidence = document.createElement('div'); evidence.textContent = 'Fresh Caretaker checks: ';
+        const evidence = document.createElement('div'); evidence.textContent = 'Structured Caretaker checks: ';
         if (!Array.isArray(checks) || checks.length === 0) {
-          evidence.append(document.createTextNode('No fresh Caretaker checks used.'));
+          evidence.append(document.createTextNode('No structured checks used; local commands may still have been used.'));
         } else {
           const list = document.createElement('ul');
           for (const check of checks) {
@@ -220,6 +247,90 @@
       const date = new Date(value);
       return Number.isNaN(date.getTime()) ? value : `${date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC')}`;
     }
+    function clearApproval() {
+      activeApproval = null;
+      approvalCard.hidden = true;
+      approvalDetails.replaceChildren();
+      approvalStatus.textContent = '';
+      approvalAllow.disabled = false; approvalDeny.disabled = false;
+    }
+    function stopApprovalPolling() {
+      chatPending = false;
+      if (approvalPollTimer !== null) clearTimeout(approvalPollTimer);
+      approvalPollTimer = null;
+      clearApproval();
+    }
+    function addApprovalDetail(label, value) {
+      if (value === undefined || value === null || value === '') return;
+      const row = document.createElement('div');
+      const term = document.createElement('dt'); term.textContent = label;
+      const detail = document.createElement('dd');
+      if (typeof value === 'string') detail.textContent = value;
+      else {
+        const pre = document.createElement('pre');
+        try { pre.textContent = JSON.stringify(value, null, 2); }
+        catch { pre.textContent = String(value); }
+        detail.append(pre);
+      }
+      row.append(term, detail); approvalDetails.append(row);
+    }
+    function showApproval(approval) {
+      if (!approval || typeof approval.id !== 'string') { clearApproval(); return; }
+      if (activeApproval?.id === approval.id) return;
+      activeApproval = approval;
+      approvalDetails.replaceChildren();
+      addApprovalDetail('Request', approval.title || approval.kind || 'Permission request');
+      addApprovalDetail('Type', approval.kind);
+      addApprovalDetail('Reason', approval.reason);
+      addApprovalDetail('Command', approval.command);
+      addApprovalDetail('Working directory', approval.cwd);
+      addApprovalDetail('File or permission details', approval.details);
+      approvalStatus.textContent = '';
+      approvalAllow.disabled = false; approvalDeny.disabled = false;
+      approvalCard.hidden = false;
+      approvalAllow.focus();
+    }
+    async function pollApproval() {
+      if (!chatPending || closing || approvalPollBusy) return;
+      approvalPollBusy = true;
+      try {
+        const response = await fetch('/approval', { cache: 'no-store', headers: { 'x-caretaker-csrf': csrf } });
+        if (!response.ok) throw new Error('Approval status is temporarily unavailable.');
+        const data = await response.json();
+        if (chatPending && !closing) showApproval(data.approval || null);
+      } catch (error) {
+        if (chatPending && !closing) approvalStatus.textContent = error.message || 'Approval status is temporarily unavailable.';
+      } finally {
+        approvalPollBusy = false;
+        if (chatPending && !closing) approvalPollTimer = setTimeout(pollApproval, 500);
+      }
+    }
+    function startApprovalPolling() {
+      stopApprovalPolling();
+      chatPending = true;
+      pollApproval();
+    }
+    async function decideApproval(decision) {
+      if (!activeApproval || !chatPending || closing) return;
+      const id = activeApproval.id;
+      approvalAllow.disabled = true; approvalDeny.disabled = true;
+      approvalStatus.textContent = 'Sending your decision…';
+      try {
+        const response = await fetch('/approval', { method: 'POST', headers: {
+          'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf },
+          body: JSON.stringify({ id, decision }), cache: 'no-store' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not send the approval decision.');
+        if (activeApproval?.id === id) clearApproval();
+      } catch (error) {
+        if (activeApproval?.id === id) {
+          approvalStatus.textContent = error.message || 'Could not send the approval decision.';
+          approvalAllow.disabled = false; approvalDeny.disabled = false;
+        }
+      }
+    }
+    approvalAllow.addEventListener('click', () => decideApproval('accept'));
+    approvalDeny.addEventListener('click', () => decideApproval('decline'));
     async function loadSummary() {
       refreshSummary.disabled = true;
       summaryStatus.textContent = 'Loading saved evidence…';
@@ -281,6 +392,7 @@
       const message = box.value.trim(); if (!message || model.disabled || !model.value || closing) return;
       add('You', message, 'user'); box.value = ''; send.disabled = true;
       status.textContent = 'Caretaker is checking…';
+      startApprovalPolling();
       try {
         const response = await fetch('/chat', { method: 'POST', headers: {
           'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf },
@@ -289,7 +401,7 @@
         if (!response.ok) throw new Error(data.error || 'Request failed.');
         add('Caretaker', data.reply, 'assistant', true, new Date().toLocaleString(), data.checks); status.textContent = '';
       } catch (error) { status.textContent = error.message || 'Chat is unavailable.'; }
-      finally { send.disabled = model.disabled || closing; box.focus(); }
+      finally { stopApprovalPolling(); send.disabled = model.disabled || closing; box.focus(); }
     });
     box.addEventListener('keydown', event => {
       if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); form.requestSubmit(); }
@@ -300,6 +412,7 @@
     refreshSummary.addEventListener('click', loadSummary);
     // pagehide also fires on reload, so the server waits briefly for the page to return before stopping.
     window.addEventListener('pagehide', () => {
+      stopApprovalPolling();
       if (closing) return;
       fetch('/leave', { method: 'POST', keepalive: true, headers: {
         'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf }, body: '{}' }).catch(() => {});
@@ -307,6 +420,7 @@
     window.addEventListener('pageshow', event => { if (event.persisted && !closing) { loadModels(); loadSummary(); } });
     stop.addEventListener('click', async () => {
       if (closing) return; closing = true;
+      stopApprovalPolling();
       try { await fetch('/close', { method: 'POST', headers: {
         'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf }, body: '{}' }); }
       catch {}

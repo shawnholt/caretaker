@@ -1,6 +1,6 @@
 'use strict';
 
-// On-demand, local-only Caretaker chat with bounded, read-only live checks.
+// On-demand, local-only Caretaker chat with full local Codex tools and explicit approvals.
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -16,7 +16,7 @@ const MAX_BODY = 8 * 1024;
 const MAX_MESSAGE = 3000;
 const MAX_REPLY = 12000;
 const MAX_TURNS = 12;
-const TURN_TIMEOUT = 120000;
+const TURN_TIMEOUT = 10 * 60 * 1000; // Includes time for the user to review approvals.
 const IDLE_TIMEOUT = 15 * 60 * 1000;
 const LEAVE_GRACE = Number(process.env.CARETAKER_CHAT_LEAVE_GRACE_MS) || 10000;
 const CHILD_EXIT_WAIT = 5000;
@@ -319,6 +319,8 @@ class CodexSession {
     this.closed = false;
     this.models = [];
     this.lastChecks = [];
+    this.pendingApprovals = new Map();
+    this.fileChangePreviews = new Map();
   }
 
   async start() {
@@ -351,7 +353,7 @@ class CodexSession {
       }));
     if (!this.models.length) throw new Error('No chat models are available in Codex.');
     const started = await this.request('thread/start', {
-      cwd: ROOT, approvalPolicy: 'never', sandbox: 'read-only',
+      cwd: ROOT, approvalPolicy: 'untrusted', sandbox: 'danger-full-access',
       personality: 'friendly', serviceName: 'goliath_caretaker_chat',
       dynamicTools: TOOL_DEFS,
     }, 15000);
@@ -399,6 +401,11 @@ class CodexSession {
     });
   }
 
+  rememberPatchPreview(itemId, changes) {
+    const preview = JSON.stringify(changes);
+    this.fileChangePreviews.set(itemId, preview.length <= 8000 ? preview : null);
+  }
+
   onLine(line) {
     if (line.length > 1024 * 1024) { this.fail(new Error('Codex response exceeded the limit.')); return; }
     let msg;
@@ -408,6 +415,10 @@ class CodexSession {
     if (typeof msg.method === 'string' && hasId) {
       // Server-initiated request: never confuse it with a reply to our own id space.
       if (msg.method === 'item/tool/call') { this.handleToolCall(msg).catch(() => {}); return; }
+      if (['item/commandExecution/requestApproval', 'item/fileChange/requestApproval',
+        'item/permissions/requestApproval'].includes(msg.method)) {
+        this.handleApprovalRequest(msg); return;
+      }
       try { this.send({ id: msg.id, error: { code: -32601, message: 'Unsupported by Caretaker chat.' } }); } catch {}
       return;
     }
@@ -421,6 +432,18 @@ class CodexSession {
       return;
     }
     if (!this.turn || msg.params?.threadId !== this.threadId) return;
+    if (['item/started', 'item/updated'].includes(msg.method) &&
+        this.ownsTurn(msg.params.turnId) && msg.params.item?.type === 'fileChange' &&
+        typeof msg.params.item.id === 'string' && Array.isArray(msg.params.item.changes) &&
+        msg.params.item.changes.length) {
+      this.rememberPatchPreview(msg.params.item.id, msg.params.item.changes);
+      return;
+    }
+    if (msg.method === 'item/fileChange/patchUpdated' && this.ownsTurn(msg.params.turnId) &&
+        typeof msg.params.itemId === 'string' && Array.isArray(msg.params.changes) && msg.params.changes.length) {
+      this.rememberPatchPreview(msg.params.itemId, msg.params.changes);
+      return;
+    }
     if (msg.method === 'item/agentMessage/delta' && typeof msg.params.delta === 'string') {
       if (!this.ownsTurn(msg.params.turnId)) return;
       this.turn.text = (this.turn.text + msg.params.delta).slice(0, MAX_REPLY);
@@ -433,6 +456,8 @@ class CodexSession {
       const active = this.turn;
       this.turn = null;
       clearTimeout(active.timer);
+      this.denyPendingApprovals();
+      this.fileChangePreviews.clear();
       if (msg.params.turn?.status !== 'completed' || msg.params.turn?.error) {
         active.reject(new Error('Codex could not complete this turn.'));
       } else {
@@ -440,6 +465,67 @@ class CodexSession {
         active.resolve(active.text || 'Codex returned no message.');
       }
     }
+  }
+
+  handleApprovalRequest(msg) {
+    const params = msg.params || {};
+    const kind = msg.method === 'item/commandExecution/requestApproval' ? 'command'
+      : msg.method === 'item/fileChange/requestApproval' ? 'file' : 'permissions';
+    if (this.closed || !this.turn || params.threadId !== this.threadId ||
+        typeof params.turnId !== 'string' || !this.ownsTurn(params.turnId) ||
+        typeof params.itemId !== 'string' || this.pendingApprovals.size >= 3) {
+      try { this.send({ id: msg.id, result: kind === 'permissions'
+        ? { permissions: {}, scope: 'turn' } : { decision: 'decline' } }); } catch {}
+      return;
+    }
+    const id = crypto.randomBytes(16).toString('hex');
+    const preview = kind === 'file' ? this.fileChangePreviews.get(params.itemId) : null;
+    const command = kind === 'command' ? params.command : null;
+    const permissionDetails = kind === 'permissions' ? JSON.stringify(params.permissions || {}) : null;
+    if ((kind === 'file' && !preview) ||
+        (kind === 'command' && (typeof command !== 'string' || !command || command.length > 8000)) ||
+        (kind === 'permissions' && (!params.permissions || permissionDetails.length > 8000)) ||
+        (typeof params.cwd === 'string' && params.cwd.length > 1000) ||
+        (typeof params.reason === 'string' && params.reason.length > 2000)) {
+      try { this.send({ id: msg.id, result: kind === 'permissions'
+        ? { permissions: {}, scope: 'turn' } : { decision: 'decline' } }); } catch {}
+      return;
+    }
+    const approval = { id, kind,
+      title: kind === 'command' ? 'Approve local command' : kind === 'file' ? 'Approve file change' : 'Approve additional access',
+      command,
+      cwd: typeof params.cwd === 'string' ? params.cwd : null,
+      reason: typeof params.reason === 'string' ? params.reason : null,
+      details: kind === 'file' ? preview
+        : kind === 'permissions' ? permissionDetails : null };
+    this.pendingApprovals.set(id, { rpcId: msg.id, kind, params, approval });
+  }
+
+  approvalView() {
+    return this.pendingApprovals.values().next().value?.approval || null;
+  }
+
+  resolveApproval(id, decision) {
+    const pending = this.pendingApprovals.get(id);
+    if (!pending || !this.turn || !this.ownsTurn(pending.params.turnId) ||
+        !['accept', 'decline'].includes(decision)) return false;
+    if (decision === 'accept' && pending.kind === 'command' &&
+        Array.isArray(pending.params.availableDecisions) &&
+        !pending.params.availableDecisions.includes('accept')) return false;
+    const result = pending.kind === 'permissions'
+      ? { permissions: decision === 'accept' ? pending.params.permissions : {}, scope: 'turn' }
+      : { decision };
+    this.send({ id: pending.rpcId, result });
+    this.pendingApprovals.delete(id);
+    return true;
+  }
+
+  denyPendingApprovals() {
+    for (const pending of this.pendingApprovals.values()) {
+      try { this.send({ id: pending.rpcId, result: pending.kind === 'permissions'
+        ? { permissions: {}, scope: 'turn' } : { decision: 'decline' } }); } catch {}
+    }
+    this.pendingApprovals.clear();
   }
 
   async handleToolCall(msg) {
@@ -474,7 +560,8 @@ class CodexSession {
     const selectedModel = model || this.models.find(item => item.isDefault)?.id || this.models[0].id;
     if (!this.models.some(item => item.id === selectedModel)) throw new Error('Choose a model from the Codex model list.');
     const evidence = boundedEvidence();
-    const prefix = `You are Goliath Caretaker for this Windows workstation. Use the read-only Caretaker tools to check live system facts when the user asks about current status, resources, processes, listeners, services, tasks, startup, or recent events. A broad slowdown question includes fresh resources and recent event health below; use those results and call additional Caretaker tools only when they would clarify the answer. Explain that a short CPU sample cannot establish sustained load and that memory working set alone does not prove pressure. Missing disk latency, paging, or history is UNKNOWN rather than healthy. Separate measured facts from possible causes and suggest the next focused check when evidence is insufficient. Do not guess current state from the historical snapshot. State the capture time and coverage for measurements; if a tool fails or evidence is missing, say UNKNOWN. You cannot change OS state or run arbitrary commands. Saved summary (historical context only): ${JSON.stringify(evidence)}\nFresh checks for this question: ${JSON.stringify(prefetched.context || 'none')}\n\nUser question: `;
+    const patchGuidance = 'If a file patch is rejected because no reviewable diff was supplied, use a local command for that requested change; the user will review and approve the exact command. ';
+    const prefix = `You are Goliath Caretaker for this Windows workstation. You may use Codex's local tools to read, diagnose, and change the system as the user requests. The dashboard will ask the user to approve each command or file change; never treat that approval as permission for unrelated actions. Do not self-elevate. Respect the current Windows account's permissions, inspect relevant state before changing it, explain material effects and rollback, and verify the result. Do not contact external services unless the user requests it. The read-only Caretaker tools provide structured checks for current status, resources, processes, listeners, services, tasks, startup, and recent events. A broad slowdown question includes fresh resources and recent event health below; use those results and call additional tools only when they would clarify the answer. A short CPU sample cannot establish sustained load, and memory working set alone does not prove pressure. Missing disk latency, paging, or history is UNKNOWN rather than healthy. Separate measured facts from possible causes. Do not guess current state from the historical snapshot. State capture time and coverage; if evidence is missing, say UNKNOWN. Saved summary (historical context only): ${JSON.stringify(evidence)}\nFresh checks for this question: ${JSON.stringify(prefetched.context || 'none')}\n\nUser question: `;
     const done = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.turn = null;
@@ -486,10 +573,10 @@ class CodexSession {
     try {
       const result = await this.request('turn/start', {
         threadId: this.threadId,
-        input: [{ type: 'text', text: prefix + message }],
+        input: [{ type: 'text', text: patchGuidance + prefix + message }],
         model: selectedModel,
-        cwd: ROOT, approvalPolicy: 'never',
-        sandboxPolicy: { type: 'readOnly' },
+        cwd: ROOT, approvalPolicy: 'untrusted',
+        sandboxPolicy: { type: 'dangerFullAccess' },
       }, 15000);
       if (!result?.turn?.id) throw new Error('Codex did not start the turn.');
       if (this.turn && this.turn.id && this.turn.id !== result.turn.id) throw new Error('Codex turn identity did not match.');
@@ -514,6 +601,7 @@ class CodexSession {
 
   close() {
     if (this.closed) return;
+    this.denyPendingApprovals();
     this.closed = true;
     this.fail(new Error('Chat closed.'));
     for (const child of ACTIVE_CARETAKER_CHILDREN) child.kill();
@@ -564,10 +652,32 @@ function main() {
       json(res, 200, { snapshot: boundedEvidence(), generatedAtUtc: new Date().toISOString() });
       return;
     }
-    if (req.method !== 'POST' || !['/chat', '/close', '/leave'].includes(req.url)) {
+    if (req.method === 'GET' && req.url === '/approval') {
+      if (req.headers['x-caretaker-csrf'] !== token) {
+        json(res, 403, { error: 'Request rejected.' }); return;
+      }
+      json(res, 200, { approval: session.approvalView() });
+      return;
+    }
+    if (req.method !== 'POST' || !['/chat', '/close', '/leave', '/approval'].includes(req.url)) {
       json(res, 404, { error: 'Not found.' }); return;
     }
     if (!validPost(req, token, port)) { json(res, 403, { error: 'Request rejected.' }); return; }
+    if (req.url === '/approval') {
+      try {
+        let body = '';
+        for await (const chunk of req) {
+          body += chunk;
+          if (Buffer.byteLength(body) > 1024) throw new Error('Approval response is too large.');
+        }
+        const parsed = JSON.parse(body);
+        if (typeof parsed.id !== 'string' || !session.resolveApproval(parsed.id, parsed.decision)) {
+          json(res, 409, { error: 'Approval is no longer pending.' }); return;
+        }
+        json(res, 200, { ok: true });
+      } catch { json(res, 400, { error: 'Invalid approval response.' }); }
+      return;
+    }
     if (req.url === '/close') { json(res, 200, { ok: true }); shutdown(); return; }
     if (req.url === '/leave') {
       json(res, 200, { ok: true });
