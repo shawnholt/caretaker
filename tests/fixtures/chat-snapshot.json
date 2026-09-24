@@ -1,0 +1,21 @@
+{
+  "capturedAtUtc": "2026-09-23T22:15:35Z",
+  "coverage": {
+    "processes": { "status": "OK", "count": 2 },
+    "tcpListeners": { "status": "OK", "count": 1 },
+    "udpEndpoints": { "status": "UNKNOWN", "count": null },
+    "services": { "status": "OK", "count": 0 },
+    "tasks": { "status": "DEGRADED", "count": 1 },
+    "startup": { "status": "OK", "count": 0 }
+  },
+  "observed": {
+    "processes": [
+      { "name": "small.exe", "workingSetBytes": 1048576, "commandLine": "PRIVATE-COMMAND" },
+      { "name": "large.exe", "workingSetBytes": 104857600, "executablePath": "PRIVATE-PATH" }
+    ],
+    "tcpListeners": [
+      { "protocol": "TCP", "localAddress": "0.0.0.0", "localPort": 4321,
+        "process": { "name": "listener.exe", "commandLine": "PRIVATE-LISTENER-COMMAND" } }
+    ]
+  }
+}

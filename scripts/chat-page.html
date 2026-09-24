@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Caretaker chat</title>
+<style nonce="caretaker">
+  :root { font: 16px/1.5 system-ui, sans-serif; color-scheme: dark; background: #111827; color: #e5e7eb }
+  body { max-width: 760px; margin: 0 auto; padding: 1.5rem }
+  h1 { font-size: 1.35rem; margin: 0 }
+  .sub { color: #9ca3af; margin: .25rem 0 1rem }
+  #transcript { min-height: 45vh; max-height: 65vh; overflow: auto; border: 1px solid #374151; border-radius: .6rem; padding: 1rem }
+  .entry { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 1rem }
+  .who { display: block; font-weight: 700; color: #93c5fd }
+  .user .who { color: #a7f3d0 }
+  form { margin-top: 1rem }
+  textarea { box-sizing: border-box; width: 100%; min-height: 6rem; padding: .7rem; border-radius: .5rem; border: 1px solid #6b7280; background: #1f2937; color: inherit; font: inherit }
+  button { margin-top: .5rem; padding: .55rem 1rem; border: 0; border-radius: .4rem; background: #60a5fa; color: #111827; font-weight: 700; cursor: pointer }
+  button:disabled { opacity: .55; cursor: wait }
+  #status { color: #fbbf24; min-height: 1.5rem }
+</style>
+<body>
+  <h1>Goliath Caretaker chat</h1>
+  <p class="sub">Questions use a saved, timestamped snapshot summary. It is historical and may be UNKNOWN.</p>
+  <div id="transcript" role="log" aria-live="polite"></div>
+  <form id="form"><label for="message">Your question</label><textarea id="message" maxlength="3000" required placeholder="What does the saved snapshot show?"></textarea><button id="send">Send</button> <button type="button" id="stop">Stop chat</button></form>
+  <p id="status" role="status"></p>
+  <script nonce="caretaker">
+    const csrf = '__CSRF_TOKEN__';
+    const form = document.getElementById('form');
+    const box = document.getElementById('message');
+    const send = document.getElementById('send');
+    const stop = document.getElementById('stop');
+    const transcript = document.getElementById('transcript');
+    const status = document.getElementById('status');
+    let closing = false;
+    function add(who, message, klass) {
+      const entry = document.createElement('p'); entry.className = 'entry ' + klass;
+      const title = document.createElement('span'); title.className = 'who'; title.textContent = who;
+      entry.append(title, document.createTextNode(message)); transcript.append(entry);
+      transcript.scrollTop = transcript.scrollHeight;
+    }
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const message = box.value.trim(); if (!message) return;
+      add('You', message, 'user'); box.value = ''; send.disabled = true;
+      status.textContent = 'Codex is thinking…';
+      try {
+        const response = await fetch('/chat', { method: 'POST', headers: {
+          'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf },
+          body: JSON.stringify({ message }), cache: 'no-store' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Request failed.');
+        add('Codex', data.reply, 'assistant'); status.textContent = '';
+      } catch (error) { status.textContent = error.message || 'Chat is unavailable.'; }
+      finally { send.disabled = false; box.focus(); }
+    });
+    window.addEventListener('pagehide', () => {
+      if (closing) return; closing = true;
+      fetch('/close', { method: 'POST', keepalive: true, headers: {
+        'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf }, body: '{}' }).catch(() => {});
+    });
+    stop.addEventListener('click', async () => {
+      if (closing) return; closing = true;
+      try { await fetch('/close', { method: 'POST', headers: {
+        'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf }, body: '{}' }); }
+      catch {}
+      send.disabled = true; box.disabled = true; stop.disabled = true;
+      status.textContent = 'Chat stopped. Close this tab.';
+    });
+  </script>
+</body>
+</html>
