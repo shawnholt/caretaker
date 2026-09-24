@@ -291,6 +291,17 @@ function checkMetadata(tool, result, completed) {
     completed };
 }
 
+function preferredSettings(models) {
+  if (!Array.isArray(models) || !models.length) throw new Error('No chat models are available.');
+  const model = models.find(item => item.id === 'gpt-6-luna') ||
+    models.find(item => /(?:^|-)luna$/.test(item.id)) ||
+    models.find(item => item.isDefault) || models[0];
+  const efforts = (model.supportedReasoningEfforts || []).map(item => item.reasoningEffort);
+  return { model: model.id, effort: efforts.includes('xhigh') ? 'xhigh'
+    : efforts.includes(model.defaultReasoningEffort) ? model.defaultReasoningEffort
+      : efforts[0] || model.defaultReasoningEffort || null };
+}
+
 async function collectSlowdownEvidence(message, runCheck = callCaretakerTool) {
   if (!isSlowdownQuestion(message)) return { checks: [], context: null };
   const checks = [];
@@ -319,6 +330,7 @@ class CodexSession {
     this.closed = false;
     this.models = [];
     this.lastChecks = [];
+    this.lastSettings = null;
     this.pendingApprovals = new Map();
     this.fileChangePreviews = new Map();
   }
@@ -350,6 +362,13 @@ class CodexSession {
     this.models = listed.data.filter(item => typeof item?.model === 'string' && item.model &&
       typeof item.displayName === 'string' && item.hidden !== true).map(item => ({
         id: item.model, displayName: item.displayName, isDefault: item.isDefault === true,
+        defaultReasoningEffort: item.defaultReasoningEffort,
+        supportedReasoningEfforts: Array.isArray(item.supportedReasoningEfforts)
+          ? item.supportedReasoningEfforts.filter(option => typeof option?.reasoningEffort === 'string' &&
+            /^[a-z]+$/.test(option.reasoningEffort)).map(option => ({
+            reasoningEffort: option.reasoningEffort,
+            description: typeof option.description === 'string' ? option.description : '',
+          })) : [],
       }));
     if (!this.models.length) throw new Error('No chat models are available in Codex.');
     const started = await this.request('thread/start', {
@@ -552,13 +571,20 @@ class CodexSession {
     }
   }
 
-  async ask(message, model, prefetched = { checks: [], context: null }) {
+  async ask(message, model, effort, prefetched = { checks: [], context: null }) {
     try { await this.start(); }
     catch (error) { this.close(); throw error; }
     if (this.turn) throw new Error('A reply is already in progress.');
     this.lastChecks = [...prefetched.checks];
-    const selectedModel = model || this.models.find(item => item.isDefault)?.id || this.models[0].id;
-    if (!this.models.some(item => item.id === selectedModel)) throw new Error('Choose a model from the Codex model list.');
+    const defaults = preferredSettings(this.models);
+    const selectedModel = this.models.find(item => item.id === (model || defaults.model));
+    if (!selectedModel) throw new Error('Choose a model from the Codex model list.');
+    const availableEfforts = selectedModel.supportedReasoningEfforts.map(item => item.reasoningEffort);
+    const selectedEffort = effort || (selectedModel.id === defaults.model ? defaults.effort
+      : selectedModel.defaultReasoningEffort || availableEfforts[0]);
+    if (!selectedEffort || !availableEfforts.includes(selectedEffort)) {
+      throw new Error('Choose a reasoning effort supported by the selected model.');
+    }
     const evidence = boundedEvidence();
     const patchGuidance = 'If a file patch is rejected because no reviewable diff was supplied, use a local command for that requested change; the user will review and approve the exact command. ';
     const prefix = `You are Goliath Caretaker for this Windows workstation. You may use Codex's local tools to read, diagnose, and change the system as the user requests. The dashboard will ask the user to approve each command or file change; never treat that approval as permission for unrelated actions. Do not self-elevate. Respect the current Windows account's permissions, inspect relevant state before changing it, explain material effects and rollback, and verify the result. Do not contact external services unless the user requests it. The read-only Caretaker tools provide structured checks for current status, resources, processes, listeners, services, tasks, startup, and recent events. A broad slowdown question includes fresh resources and recent event health below; use those results and call additional tools only when they would clarify the answer. A short CPU sample cannot establish sustained load, and memory working set alone does not prove pressure. Missing disk latency, paging, or history is UNKNOWN rather than healthy. Separate measured facts from possible causes. Do not guess current state from the historical snapshot. State capture time and coverage; if evidence is missing, say UNKNOWN. Saved summary (historical context only): ${JSON.stringify(evidence)}\nFresh checks for this question: ${JSON.stringify(prefetched.context || 'none')}\n\nUser question: `;
@@ -574,14 +600,17 @@ class CodexSession {
       const result = await this.request('turn/start', {
         threadId: this.threadId,
         input: [{ type: 'text', text: patchGuidance + prefix + message }],
-        model: selectedModel,
+        model: selectedModel.id,
+        effort: selectedEffort,
         cwd: ROOT, approvalPolicy: 'untrusted',
         sandboxPolicy: { type: 'dangerFullAccess' },
       }, 15000);
       if (!result?.turn?.id) throw new Error('Codex did not start the turn.');
       if (this.turn && this.turn.id && this.turn.id !== result.turn.id) throw new Error('Codex turn identity did not match.');
       if (this.turn) this.turn.id = result.turn.id;
-      return await done;
+      const reply = await done;
+      this.lastSettings = { model: selectedModel.id, effort: selectedEffort };
+      return reply;
     } catch (error) {
       if (this.turn) { clearTimeout(this.turn.timer); this.turn = null; }
       this.close();
@@ -637,8 +666,9 @@ function main() {
       clearTimeout(leaveTimer); leaveTimer = null;
       try {
         await session.start();
+        const defaults = preferredSettings(session.models);
         json(res, 200, { models: session.models,
-          selectedModel: session.models.find(item => item.isDefault)?.id || session.models[0].id });
+          selectedModel: defaults.model, selectedEffort: defaults.effort });
       } catch (error) {
         session.close();
         json(res, 503, { error: error.message || 'Could not load Codex models.' });
@@ -700,11 +730,15 @@ function main() {
       if (typeof parsed.model !== 'string' || parsed.model.length > 100) {
         throw new Error('Choose a model from the list.');
       }
+      if (parsed.effort !== undefined &&
+          (typeof parsed.effort !== 'string' || parsed.effort.length > 20)) {
+        throw new Error('Choose a reasoning effort from the list.');
+      }
       turns++;
       const question = parsed.message.trim();
       const prefetched = await collectSlowdownEvidence(question);
-      const reply = await session.ask(question, parsed.model, prefetched);
-      json(res, 200, { reply, checks: session.lastChecks });
+      const reply = await session.ask(question, parsed.model, parsed.effort, prefetched);
+      json(res, 200, { reply, checks: session.lastChecks, ...session.lastSettings });
     } catch (error) {
       json(res, 400, { error: error.message || 'Chat failed.' });
     } finally { busy = false; }
@@ -747,5 +781,5 @@ function main() {
 
 if (require.main === module) main();
 module.exports = { boundedEvidence, validHost, validPost, isolatedCodexArgs, compactInventory,
-  nameQuery, callCaretakerTool, isSlowdownQuestion, collectSlowdownEvidence, CodexSession,
+  nameQuery, callCaretakerTool, isSlowdownQuestion, collectSlowdownEvidence, preferredSettings, CodexSession,
   resolveCodexExe, resolveNpmWrapperCodexExe, resolvePathCodexExe };

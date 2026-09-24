@@ -35,30 +35,38 @@ async function main() {
     assert.equal(modelResponse.status, 200, listing.error);
     assert.ok(listing.models?.length, 'models are available');
     assert.ok(listing.models.some(item => item.id === listing.selectedModel));
+    assert.equal(listing.selectedModel, 'gpt-6-luna', 'Luna is the initial model');
+    assert.equal(listing.selectedEffort, 'xhigh', 'extra-high is the initial effort');
     const response = await fetch(url + 'chat', { method: 'POST', headers: {
       'content-type': 'application/json', origin: url.slice(0, -1), 'x-caretaker-csrf': token,
-    }, body: JSON.stringify({ model: listing.selectedModel,
+    }, body: JSON.stringify({ model: listing.selectedModel, effort: listing.selectedEffort,
       message: slowdown ? 'Do you see anything that could be slowing the system down right now? Tell me what you checked, what you found, and what remains unknown.'
         : 'Check current system CPU and memory usage now with a fresh Caretaker sample. Report timestamp, overall system CPU percent, RAM used percent, and at least one current top CPU process.' }) });
     const answer = await response.json();
     assert.equal(response.status, 200, answer.error);
     assert.ok(answer.reply?.length > 20, 'Codex returned an answer');
+    assert.equal(answer.model, listing.selectedModel);
+    assert.equal(answer.effort, listing.selectedEffort);
     if (slowdown) {
       assert.ok(answer.checks?.some(check => check.tool === 'resources' && check.completed), 'fresh resource check completed');
       assert.ok(answer.checks?.some(check => check.tool === 'event_health' && check.completed), 'fresh event check completed');
     }
     console.log(JSON.stringify({ models: listing.models.length, selectedModel: listing.selectedModel,
+      selectedEffort: listing.selectedEffort,
       checks: answer.checks, reply: answer.reply.slice(0, 2500) }));
-    const otherModel = listing.models.find(item => item.id.includes('luna')) || listing.models.find(item => item.id !== listing.selectedModel);
+    const otherModel = listing.models.find(item => item.id !== listing.selectedModel);
     if (otherModel && !slowdown) {
       const secondResponse = await fetch(url + 'chat', { method: 'POST', headers: {
         'content-type': 'application/json', origin: url.slice(0, -1), 'x-caretaker-csrf': token,
-      }, body: JSON.stringify({ model: otherModel.id,
+      }, body: JSON.stringify({ model: otherModel.id, effort: otherModel.defaultReasoningEffort,
         message: 'How much CPU and memory is WorldOfWarshipsLegends.exe using right now? Please take a fresh named-process sample.' }) });
       const second = await secondResponse.json();
       assert.equal(secondResponse.status, 200, second.error);
       assert.ok(second.reply?.length > 20);
-      console.log(JSON.stringify({ switchedModel: otherModel.id, reply: second.reply.slice(0, 1500) }));
+      assert.equal(second.model, otherModel.id);
+      assert.equal(second.effort, otherModel.defaultReasoningEffort);
+      console.log(JSON.stringify({ switchedModel: otherModel.id, switchedEffort: second.effort,
+        reply: second.reply.slice(0, 1500) }));
     }
     const close = await fetch(url + 'close', { method: 'POST', headers: {
       'content-type': 'application/json', origin: url.slice(0, -1), 'x-caretaker-csrf': token,

@@ -15,6 +15,7 @@
   h1 { font-size: 1.35rem; line-height: 1.2; margin: 0 }
   .sub { color: var(--muted); margin: .35rem 0 0 }
   .header-actions { display: flex; align-items: end; gap: .65rem }
+  .model-settings { display: flex; flex-wrap: wrap; gap: .65rem }
   label { display: block; font-size: .9rem; font-weight: 650 }
   select, textarea { width: 100%; padding: .7rem .8rem; border-radius: .55rem; border: 1px solid #526176; background: #0d1727; color: inherit }
   select { min-width: 180px; margin-top: .25rem }
@@ -30,6 +31,7 @@
   .who { display: block; font-weight: 750; color: var(--blue); margin-bottom: .25rem }
   .user .who { color: #86efac }
   .answer-meta { color: var(--muted); font-size: .82rem; margin-top: .65rem; border-top: 1px solid var(--line); padding-top: .45rem }
+  .selection-meta { color: #cbd5e1 }
   .composer { border-top: 1px solid var(--line); padding-top: 1rem }
   .composer-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: .4rem; margin-bottom: .4rem }
   .composer-head label { font-size: 1rem }
@@ -72,7 +74,7 @@
   .md code { padding: .08rem .25rem; border-radius: .2rem; background: #1f2937; font-family: ui-monospace, monospace }
   .md pre code { padding: 0; background: transparent }
   @media (max-width: 760px) { body { padding: 1rem } .layout { grid-template-columns: 1fr } aside { order: 2 } #transcript { min-height: 30vh; max-height: 55vh } }
-  @media (max-width: 480px) { body { padding: .75rem } header { align-items: stretch } .header-actions { width: 100%; justify-content: space-between; align-items: end } select { min-width: 0 } .chat { padding: .75rem } .composer-actions { align-items: stretch; flex-direction: column-reverse } .composer-actions button { width: 100% } }
+  @media (max-width: 480px) { body { padding: .75rem } header { align-items: stretch } .header-actions { width: 100%; flex-direction: column; align-items: stretch } .model-settings { display: grid; grid-template-columns: 1fr 1fr } .model-settings label, .model-settings select { min-width: 0; width: 100% } .chat { padding: .75rem } .composer-actions { align-items: stretch; flex-direction: column-reverse } .composer-actions button { width: 100% } }
 </style>
 <body>
   <a class="skip" href="#message">Skip to question</a>
@@ -82,7 +84,10 @@
       <p class="sub">Ask questions or request local changes. Review each command or file change before it runs.</p>
     </div>
     <div class="header-actions">
-      <label for="model">Model<select id="model" disabled><option>Loading models…</option></select></label>
+      <div class="model-settings" aria-label="Chat model settings">
+        <label for="model">Model<select id="model" disabled><option>Loading models…</option></select></label>
+        <label for="effort">Reasoning<select id="effort" disabled><option>Loading…</option></select></label>
+      </div>
       <button id="stop" class="stop" type="button">Stop chat</button>
     </div>
   </header>
@@ -145,6 +150,7 @@
     const send = document.getElementById('send');
     const stop = document.getElementById('stop');
     const model = document.getElementById('model');
+    const effort = document.getElementById('effort');
     const transcript = document.getElementById('transcript');
     const welcome = document.getElementById('welcome');
     const status = document.getElementById('status');
@@ -211,7 +217,7 @@
       if (code) parent.append(code.pre);
       flushParagraph(); flushList();
     }
-    function add(who, message, klass, markdown = false, receivedAt = '', checks = null) {
+    function add(who, message, klass, markdown = false, receivedAt = '', checks = null, selected = null) {
       if (welcome?.isConnected) welcome.remove();
       const entry = document.createElement('div'); entry.className = 'entry ' + klass;
       const title = document.createElement('span'); title.className = 'who'; title.textContent = who;
@@ -221,6 +227,11 @@
         const meta = document.createElement('div'); meta.className = 'answer-meta';
         const received = document.createElement('div'); received.textContent = `Reply received (local time): ${receivedAt}.`;
         meta.append(received);
+        if (selected?.model && selected?.effort) {
+          const selection = document.createElement('div'); selection.className = 'selection-meta';
+          selection.textContent = `Model: ${selected.model} · Reasoning: ${effortLabel(selected.effort)}.`;
+          meta.append(selection);
+        }
         const evidence = document.createElement('div'); evidence.textContent = 'Structured Caretaker checks: ';
         if (!Array.isArray(checks) || checks.length === 0) {
           evidence.append(document.createTextNode('No structured checks used; local commands may still have been used.'));
@@ -246,6 +257,36 @@
       if (typeof value !== 'string' || !value || value === 'UNKNOWN') return 'UNKNOWN';
       const date = new Date(value);
       return Number.isNaN(date.getTime()) ? value : `${date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC')}`;
+    }
+    const effortLabels = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Maximum' };
+    function effortLabel(value) { return effortLabels[value] || value; }
+    let availableModels = [];
+    function modelEfforts(selectedModel) {
+      const selected = availableModels.find(item => item.id === selectedModel);
+      return Array.isArray(selected?.supportedReasoningEfforts)
+        ? selected.supportedReasoningEfforts.filter(item => item && typeof item.reasoningEffort === 'string') : [];
+    }
+    function populateEfforts(selectedModel, preferredEffort = '') {
+      const supported = modelEfforts(selectedModel);
+      effort.replaceChildren();
+      for (const item of supported) {
+        const value = item.reasoningEffort;
+        const option = document.createElement('option'); option.value = value;
+        option.textContent = effortLabels[value] || value;
+        if (typeof item.description === 'string' && item.description) option.title = item.description;
+        effort.append(option);
+      }
+      if (!supported.length) {
+        const option = document.createElement('option'); option.textContent = 'Unavailable'; effort.append(option);
+        effort.disabled = true;
+        return;
+      }
+      const selected = availableModels.find(item => item.id === selectedModel);
+      const fallback = selected?.defaultReasoningEffort;
+      const nextEffort = supported.some(item => item.reasoningEffort === preferredEffort) ? preferredEffort
+        : supported.some(item => item.reasoningEffort === fallback) ? fallback : supported[0].reasoningEffort;
+      effort.value = nextEffort;
+      effort.disabled = false;
     }
     function clearApproval() {
       activeApproval = null;
@@ -371,9 +412,9 @@
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Could not load models.');
         if (!Array.isArray(data.models) || !data.models.length) throw new Error('No chat models are available.');
+        availableModels = data.models.filter(item => item && typeof item.id === 'string' && typeof item.displayName === 'string');
         model.replaceChildren();
-        for (const item of data.models) {
-          if (!item || typeof item.id !== 'string' || typeof item.displayName !== 'string') continue;
+        for (const item of availableModels) {
           const option = document.createElement('option'); option.value = item.id; option.textContent = item.displayName;
           option.selected = item.id === data.selectedModel || item.isDefault === true;
           model.append(option);
@@ -381,27 +422,36 @@
         if (!model.options.length) throw new Error('No chat models are available.');
         if (data.selectedModel && [...model.options].some(option => option.value === data.selectedModel)) model.value = data.selectedModel;
         else if (![...model.options].some(option => option.selected)) model.selectedIndex = 0;
-        model.disabled = false; send.disabled = false; status.textContent = '';
+        populateEfforts(model.value, data.selectedEffort || '');
+        model.disabled = false; send.disabled = effort.disabled; status.textContent = '';
       } catch (error) {
         model.replaceChildren(); const option = document.createElement('option'); option.textContent = 'Models unavailable'; model.append(option);
         status.textContent = error.message || 'Could not load chat models.';
       }
     }
+    model.addEventListener('change', () => {
+      const previousEffort = effort.value;
+      const preferred = model.value === 'gpt-6-luna' ? 'xhigh' : previousEffort;
+      populateEfforts(model.value, preferred);
+      send.disabled = effort.disabled || closing || chatPending;
+    });
     form.addEventListener('submit', async event => {
       event.preventDefault();
-      const message = box.value.trim(); if (!message || model.disabled || !model.value || closing) return;
+      const message = box.value.trim(); if (!message || model.disabled || effort.disabled || !model.value || !effort.value || closing) return;
+      const submittedModel = model.value, submittedEffort = effort.value;
       add('You', message, 'user'); box.value = ''; send.disabled = true;
       status.textContent = 'Caretaker is checking…';
       startApprovalPolling();
       try {
         const response = await fetch('/chat', { method: 'POST', headers: {
           'Content-Type': 'application/json', 'X-Caretaker-CSRF': csrf },
-          body: JSON.stringify({ message, model: model.value }), cache: 'no-store' });
+          body: JSON.stringify({ message, model: submittedModel, effort: submittedEffort }), cache: 'no-store' });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Request failed.');
-        add('Caretaker', data.reply, 'assistant', true, new Date().toLocaleString(), data.checks); status.textContent = '';
+        add('Caretaker', data.reply, 'assistant', true, new Date().toLocaleString(), data.checks,
+          { model: data.model || submittedModel, effort: data.effort || submittedEffort }); status.textContent = '';
       } catch (error) { status.textContent = error.message || 'Chat is unavailable.'; }
-      finally { stopApprovalPolling(); send.disabled = model.disabled || closing; box.focus(); }
+      finally { stopApprovalPolling(); send.disabled = model.disabled || effort.disabled || closing; box.focus(); }
     });
     box.addEventListener('keydown', event => {
       if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); form.requestSubmit(); }
