@@ -169,11 +169,13 @@ function Start-CaretakerLease {
   $evidenceUsedBytes = Get-LeaseEvidenceUsage -EvidenceRoot $EvidenceRoot
   $storageBudgetBytes = [long]$Manifest.deployment.storageBudgetMiB * 1048576
   if ($storageBudgetBytes -lt 1 -or ($evidenceUsedBytes + $OutputLimitBytes) -gt $storageBudgetBytes) { throw 'Evidence storage budget is exceeded or unknown; lease launch refused.' }
-  $rootFull = [System.IO.Path]::GetFullPath($EvidenceRoot).TrimEnd('\') + '\'
+  $rootFull = [System.IO.Path]::GetFullPath($EvidenceRoot)
   $outputFull = [System.IO.Path]::GetFullPath($OutputPath)
-  if (-not $outputFull.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase) -or (Split-Path -Parent $outputFull) -ine $rootFull.TrimEnd('\')) { throw 'Output path must be a direct file beneath the ignored evidence root.' }
+  $outputParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $outputFull))
+  if ($outputParent -cne $rootFull) { throw 'Output path must be a direct file beneath the ignored evidence root.' }
   $stateFull = [System.IO.Path]::GetFullPath($StatePath)
-  if (-not $stateFull.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'Lease state path must be beneath the ignored evidence root.' }
+  $stateParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $stateFull))
+  if ($stateParent -cne $rootFull -and $stateFull -cne $rootFull) { throw 'Lease state path must be beneath the ignored evidence root.' }
   $prior = Read-LeaseRecord -Path $stateFull
   if ($null -ne $prior -and [string]$prior.cleanupStatus -ne 'STOPPED') { throw 'An earlier lease is not verified stopped; new capture refused.' }
   if (Test-Path -LiteralPath $outputFull) { throw 'Output path already exists; lease launch will not overwrite evidence.' }

@@ -50,10 +50,9 @@ try {
   Assert-True ($plan.action -eq 'Plan' -and $plan.changeRowsEligible -eq 1) 'Plan identifies only the expired valid change row without applying it'
   Assert-True ((Get-Content -LiteralPath $changesPath).Count -eq 3) 'Plan leaves the journal unchanged'
 
-  $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $priorErrorPreference = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  $applyOutput = & $powershell -NoProfile -File $retentionScript -Action Apply -EvidenceRoot $fixtureRoot -FixtureMode -FixtureBudgetMiB 1 2>&1 | Out-String
+  $applyOutput = & $retentionScript -Action Apply -EvidenceRoot $fixtureRoot -FixtureMode -FixtureBudgetMiB 1 2>&1 | Out-String
   $applyExitCode = $LASTEXITCODE
   $ErrorActionPreference = $priorErrorPreference
   if ($applyExitCode -ne 2) { throw "Fixture Apply failed with exit ${applyExitCode}: $applyOutput" }
@@ -66,7 +65,15 @@ try {
   Assert-True ((Get-Content -LiteralPath $legacyPath -Raw) -ceq $legacyBefore) 'Legacy evidence is outside retention scope'
   Assert-True ($null -ne $applied.lastAppliedUtc -and $null -ne $applied.nextDueUtc) 'Apply exposes a machine-readable last-run and next-due marker'
   $marker = Get-Content -LiteralPath (Join-Path $fixtureRoot 'retention-state.json') -Raw | ConvertFrom-Json
-  Assert-True ($marker.lastAppliedUtc -eq $applied.lastAppliedUtc -and $marker.nextDueUtc -eq $applied.nextDueUtc) 'Canonical retention-state.json marker matches the Apply summary'
+  $appliedLast = [DateTimeOffset]::MinValue
+  $appliedNext = [DateTimeOffset]::MinValue
+  $markerLast = [DateTimeOffset]::MinValue
+  $markerNext = [DateTimeOffset]::MinValue
+  $parsed = [DateTimeOffset]::TryParse([string]$applied.lastAppliedUtc, [ref]$appliedLast) -and
+    [DateTimeOffset]::TryParse([string]$applied.nextDueUtc, [ref]$appliedNext) -and
+    [DateTimeOffset]::TryParse([string]$marker.lastAppliedUtc, [ref]$markerLast) -and
+    [DateTimeOffset]::TryParse([string]$marker.nextDueUtc, [ref]$markerNext)
+  Assert-True ($parsed -and $appliedLast -eq $markerLast -and $appliedNext -eq $markerNext) 'Canonical retention-state.json marker matches the Apply summary'
   Write-Output 'Retention fixture smoke checks passed.'
 } finally {
   if (Test-Path -LiteralPath $fixtureRoot -PathType Container) { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force }

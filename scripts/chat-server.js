@@ -323,7 +323,9 @@ class CodexSession {
       if (typeof text === 'string') this.turn.text = text.slice(0, MAX_REPLY);
     } else if (msg.method === 'turn/completed') {
       const active = this.turn;
-      if (active.id && msg.params.turn?.id !== active.id) return;
+      if (!active) return;
+      const completedId = msg.params.turn?.id;
+      if (completedId && (!active.id || completedId !== active.id)) return;
       this.turn = null;
       clearTimeout(active.timer);
       if (msg.params.turn?.status !== 'completed' || msg.params.turn?.error) {

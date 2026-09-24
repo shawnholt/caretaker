@@ -46,7 +46,7 @@ function New-FixtureBackend {
   }
 }
 
-$evidenceRoot = Join-Path (Join-Path $PSScriptRoot '..') ('evidence\lease-smoke-' + [Guid]::NewGuid().ToString('N'))
+$evidenceRoot = Join-Path (Join-Path $PSScriptRoot '..') ('evidence/lease-smoke-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
 $statePath = Join-Path $evidenceRoot 'active-lease.json'
 $manifest = [pscustomobject]@{
@@ -57,9 +57,13 @@ $fixture = @{ events = @(); task = $null; session = $null; armFails = $false; st
 $backend = New-FixtureBackend $fixture
 
 $utcCreation = Convert-LeaseCreationTimeToUtc -Value ([DateTime]::SpecifyKind([DateTime]'2026-09-23T12:00:00', [DateTimeKind]::Utc))
-$dmtfCreation = Convert-LeaseCreationTimeToUtc -Value '20260923120000.000000-240'
 Assert-True ($utcCreation.ToString('o') -eq '2026-09-23T12:00:00.0000000Z') 'DateTime CIM creation values preserve UTC identity'
-Assert-True ($dmtfCreation.ToString('o') -eq '2026-09-23T16:00:00.0000000Z') 'DMTF CIM creation strings convert their UTC offset correctly'
+if ($IsWindows) {
+  $dmtfCreation = Convert-LeaseCreationTimeToUtc -Value '20260923120000.000000-240'
+  Assert-True ($dmtfCreation.ToString('o') -eq '2026-09-23T16:00:00.0000000Z') 'DMTF CIM creation strings convert their UTC offset correctly'
+} else {
+  Write-Output 'SKIP: DMTF CIM conversion requires Windows Management.'
+}
 
 $denied = $false
 try {
@@ -74,7 +78,7 @@ $armDenied = $false
 $armStatePath = Join-Path $evidenceRoot 'arm-failed.json'
 try {
   Start-CaretakerLease -Manifest $manifest -Backend $backend -StatePath $armStatePath -EvidenceRoot $evidenceRoot -Owner 'fixture' -Purpose 'fixture capture' -Target 'system-performance' -OutputPath (Join-Path $evidenceRoot 'capture.blg') -OutputLimitBytes 1048576 -DurationSeconds 10 -OwnerProcessId 42 | Out-Null
-} catch { $armDenied = $_.Exception.Message -like '*expiry could not be proven armed*' }
+} catch { $armDenied = $_.Exception.Message -match 'proven armed' }
 Assert-True $armDenied 'failed expiry arming refuses collector launch'
 Assert-True (-not ($fixture.events -contains 'StartSession')) 'collector launch does not occur after expiry arm failure'
 Assert-True ((Get-Content -LiteralPath $armStatePath -Raw | ConvertFrom-Json).cleanupStatus -eq 'EXPIRY_ARM_FAILED') 'failed expiry arm leaves a visible recovery record'

@@ -41,8 +41,10 @@ try {
   $html = [System.IO.File]::ReadAllText($outputPath)
   Assert-True ($html.Contains('FRESH')) 'freshness is computed from capturedAtUtc'
   Assert-True ($html.Contains('Freshness when generated')) 'static freshness label identifies when it was evaluated'
-  Assert-True ($html.Contains('4 / 6 OK')) 'coverage summary counts only modules explicitly reported OK'
-  Assert-True ($html.Contains('Saved rows; coverage may be partial')) 'listener tile describes its evidence limit'
+  Assert-True ($html.Contains('4 / 6') -and $html.Contains('modules collected OK')) 'coverage summary counts only modules explicitly reported OK'
+  Assert-True ($html.Contains('TCP listeners') -and $html.Contains('Review')) 'listener section carries review status'
+  Assert-True ($html.Contains('Needs attention') -and $html.Contains('button.help')) 'summary exposes attention count and contextual help'
+  Assert-True ($html.Contains('Memory at capture (working set)')) 'resource table labels the single-point memory sample'
   Assert-True ($html.Contains('SAVED EVIDENCE') -and $html.Contains('Evidence mode')) 'page identifies its static saved-evidence scope'
   Assert-True ($html.Contains('does not certify overall machine health')) 'coverage is not presented as an overall health claim'
   Assert-True ($html.Contains('DEGRADED')) 'partial module state is displayed'
@@ -68,9 +70,9 @@ try {
   [System.IO.File]::WriteAllText((Join-Path $missingRoot 'snapshot.json'), '{}', (New-Object System.Text.UTF8Encoding($false)))
   & $dashboardScript -EvidenceRoot $missingRoot -OutputPath $missingOutput | Out-Null
   $partialHtml = [System.IO.File]::ReadAllText($missingOutput)
-  Assert-True ($partialHtml.Contains('UNKNOWN</strong><span class="metric-detail">Timestamp from saved snapshot')) 'missing timestamp remains unknown'
+  Assert-True ($partialHtml.Contains('UNKNOWN</strong><span class="metric-detail">UTC evidence: UNKNOWN')) 'missing timestamp remains unknown'
   Assert-True ([regex]::Matches($partialHtml, 'class="state state-unknown"').Count -eq 6) 'missing coverage remains unknown for all modules'
-  Assert-True ($partialHtml.Contains('0 / 6 OK') -and $partialHtml.Contains('class="metric-value unknown"')) 'missing evidence does not inflate coverage or freshness'
+  Assert-True ($partialHtml.Contains('0 / 6') -and $partialHtml.Contains('class="metric-value unknown"')) 'missing evidence does not inflate coverage or freshness'
 
   Write-Output 'Dashboard smoke checks passed.'
 } finally {

@@ -638,19 +638,34 @@ function Get-AlertCandidates {
   $candidates = @{}
   $previousListeners = @{}
   $activeAlertIds = @{}
+  $previousCoverage = $null
   $alertState = Read-JsonFile -Path $script:AlertStatePath
   if ($alertState -and $alertState.active) { foreach ($entry in @($alertState.active)) { $activeAlertIds[[string]$entry.id] = $true } }
   if ($PreviousSnapshot) {
-    foreach ($listener in @($PreviousSnapshot.observed.tcpListeners) + @($PreviousSnapshot.observed.udpEndpoints)) {
-      $previousListeners[(Get-ListenerKey $listener)] = $true
+    $prevTcpOk = $false
+    $prevUdpOk = $false
+    if ($PreviousSnapshot.PSObject.Properties.Name -contains 'coverage') { $previousCoverage = $PreviousSnapshot.coverage }
+    if ($previousCoverage) {
+      if ($previousCoverage.tcpListeners) { $prevTcpOk = ($previousCoverage.tcpListeners.status -eq 'OK') }
+      if ($previousCoverage.udpEndpoints) { $prevUdpOk = ($previousCoverage.udpEndpoints.status -eq 'OK') }
+    }
+    foreach ($listener in @($PreviousSnapshot.observed.tcpListeners)) {
+      if ($prevTcpOk) { $previousListeners[(Get-ListenerKey $listener)] = $true }
+    }
+    foreach ($listener in @($PreviousSnapshot.observed.udpEndpoints)) {
+      if ($prevUdpOk) { $previousListeners[(Get-ListenerKey $listener)] = $true }
     }
   }
   foreach ($listener in @($Inventory.items.tcpListeners) + @($Inventory.items.udpEndpoints)) {
     $moduleName = if ($listener.protocol -eq 'TCP') { 'tcpListeners' } else { 'udpEndpoints' }
-    if ($Inventory.coverage.$moduleName.status -eq 'OK' -and $PreviousSnapshot -and $listener.protocol -eq 'TCP' -and -not (Test-ListenerApproved -Listener $listener -Desired $Desired)) {
+    $prevModuleOk = $false
+    if ($PreviousSnapshot -and $previousCoverage -and $previousCoverage.$moduleName) {
+      $prevModuleOk = ($previousCoverage.$moduleName.status -eq 'OK')
+    }
+    if ($Inventory.coverage.$moduleName.status -eq 'OK' -and $PreviousSnapshot -and $prevModuleOk -and $listener.protocol -eq 'TCP' -and -not (Test-ListenerApproved -Listener $listener -Desired $Desired)) {
       $key = Get-ListenerKey $listener
       $id = 'unreviewed-listener:' + $key
-      $isNewObservation = (-not $PreviousSnapshot) -or (-not $previousListeners.ContainsKey($key))
+      $isNewObservation = (-not $previousListeners.ContainsKey($key))
       if (-not $isNewObservation -and -not $activeAlertIds.ContainsKey($id)) { continue }
       $candidates[$id] = [pscustomobject]@{
         id = $id; rule = 'unreviewed-listener'; severity = 'review';

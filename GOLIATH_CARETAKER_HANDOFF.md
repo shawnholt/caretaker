@@ -23,7 +23,7 @@ Goliath is Shawn's Windows development workstation. Prior context reports Window
 
 Existing project root reported: `C:\Users\pub\Python`.
 Existing bridge project reported: `C:\Users\pub\Python\codex-mcp-bridge`.
-Prior diagnostics may exist in a `systemdiag` project or associated scripts. Discover targeted existing files before creating overlapping collection.
+Prior one-off diagnostics may exist outside this repository. Discover targeted existing files before creating overlapping collection.
 
 The bridge's fetched operations guide already defines lifecycle/status/startup commands and process/profile ownership rules. Reuse its supported status interfaces; do not introduce another bridge or app-server supervisor. Do not change its authentication, profile ownership, or production runtime as part of this project.
 

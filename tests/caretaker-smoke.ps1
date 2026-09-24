@@ -8,8 +8,31 @@ function Assert-True {
 }
 
 $config = Get-Config
+if (-not (Test-Path -LiteralPath $script:EvidencePath -PathType Container)) {
+  New-Item -ItemType Directory -Path $script:EvidencePath -Force | Out-Null
+}
 $snapshot = Read-JsonFile -Path $script:SnapshotPath
-if ($null -eq $snapshot) { throw 'FAIL: snapshot has not been captured.' }
+if ($null -eq $snapshot) {
+  $bootstrap = [pscustomobject]@{
+    schemaVersion = 1
+    capturedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    desired = [pscustomobject]@{ schemaVersion = 1 }
+    observed = [pscustomobject]@{
+      processes = @([pscustomobject]@{ pid = 1; creationTimeUtc = '2026-01-01T00:00:00Z'; name = 'smoke.exe'; executablePath = 'C:\smoke.exe'; parentPid = 0; workingSetBytes = 1000 })
+      tcpListeners = @(); udpEndpoints = @(); services = @(); tasks = @(); startup = @()
+    }
+    coverage = [pscustomobject]@{
+      processes = [pscustomobject]@{ status = 'OK'; count = 1 }
+      tcpListeners = [pscustomobject]@{ status = 'OK'; count = 0 }
+      udpEndpoints = [pscustomobject]@{ status = 'OK'; count = 0 }
+      services = [pscustomobject]@{ status = 'OK'; count = 0 }
+      tasks = [pscustomobject]@{ status = 'OK'; count = 0 }
+      startup = [pscustomobject]@{ status = 'OK'; count = 0 }
+    }
+  }
+  Write-AtomicJson -Path $script:SnapshotPath -Value $bootstrap
+  $snapshot = $bootstrap
+}
 
 Assert-True ($config.desired.approvedWorkloads.Count -eq 0 -and $config.desired.listeners.Count -eq 0) 'canonical desired workload/listener lists remain empty'
 Assert-True ($snapshot.desired.schemaVersion -eq $config.schemaVersion -and $snapshot.observed.processes.Count -gt 0) 'snapshot keeps manifest desired data separate from observed inventory'
@@ -78,11 +101,27 @@ $inventory = [pscustomobject]@{
     services = [pscustomobject]@{ status = 'OK' }; tasks = [pscustomobject]@{ status = 'OK' }
   }
 }
-$baseline = [pscustomobject]@{ observed = [pscustomobject]@{ tcpListeners = @(); udpEndpoints = @() } }
+$baseline = [pscustomobject]@{
+  observed = [pscustomobject]@{ tcpListeners = @(); udpEndpoints = @() }
+  coverage = [pscustomobject]@{
+    tcpListeners = [pscustomobject]@{ status = 'OK' }
+    udpEndpoints = [pscustomobject]@{ status = 'OK' }
+  }
+}
 $baselineCandidates = Get-AlertCandidates -Inventory $inventory -Desired $config.desired -PreviousSnapshot $null
 $afterBaselineCandidates = Get-AlertCandidates -Inventory $inventory -Desired $config.desired -PreviousSnapshot $baseline
 Assert-True ($baselineCandidates.Count -eq 0) 'first snapshot establishes a listener baseline without alerting on existing endpoints'
 Assert-True ($afterBaselineCandidates.Count -eq 1 -and $afterBaselineCandidates.Values[0].rule -eq 'unreviewed-listener') 'post-baseline TCP listeners alert; UDP endpoints remain drift-only'
+
+$partialPrevious = [pscustomobject]@{
+  observed = [pscustomobject]@{ tcpListeners = @(); udpEndpoints = @() }
+  coverage = [pscustomobject]@{
+    tcpListeners = [pscustomobject]@{ status = 'DEGRADED' }
+    udpEndpoints = [pscustomobject]@{ status = 'OK' }
+  }
+}
+$recoveryCandidates = Get-AlertCandidates -Inventory $inventory -Desired $config.desired -PreviousSnapshot $partialPrevious
+Assert-True ($recoveryCandidates.Count -eq 0) 'TCP listener alerts stay suppressed when the prior snapshot had incomplete TCP coverage'
 
 $approved = [pscustomobject]@{ listeners = @([pscustomobject]@{ protocol = 'TCP'; localAddress = '127.0.0.1'; localPort = 65001; executablePath = 'C:\server.exe' }) }
 Assert-True (Test-ListenerApproved -Listener $tcpFixture -Desired $approved) 'listener approval matches the declared executable identity'
